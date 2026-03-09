@@ -1068,14 +1068,32 @@ async function executeTool(name, input) {
   switch (name) {
     case 'get_calendar':              return await getCalendarEvents();
     case 'get_yesterday_events':      return await getYesterdayEvents();
-    case 'create_calendar_event':     return await createCalendarEvent(input.summary, input.start, input.end, input.description || '');
+    case 'create_calendar_event': {
+      const id = queueApproval('create_calendar_event',
+        { summary: input.summary, start: input.start, end: input.end, description: input.description || '' },
+        `EVENT: ${input.summary}\nSTART: ${input.start}\nEND: ${input.end}`
+      );
+      return `Queued for approval [ID: ${id}]\n\nCalendar event: ${input.summary}\nStart: ${input.start}\nEnd: ${input.end}\n\nReply "approve ${id}" to create or "deny ${id}" to cancel.`;
+    }
     case 'get_emails':                return await getUnreadEmails(input.max || 8);
     case 'draft_email_replies':       return await draftAllUnreadReplies();
-    case 'send_email':                return await sendEmail(input.to, input.subject, input.body);
+    case 'send_email': {
+      const id = queueApproval('send_email',
+        { to: input.to, subject: input.subject, body: input.body },
+        `EMAIL TO: ${input.to}\nSUBJECT: ${input.subject}\n\n${input.body.substring(0, 300)}`
+      );
+      return `Queued for approval [ID: ${id}]\n\nTo: ${input.to}\nSubject: ${input.subject}\n\n${input.body.substring(0, 200)}\n\nReply "approve ${id}" to send or "deny ${id}" to cancel.`;
+    }
     case 'get_notion_tasks':          return await getNotionTasks();
     case 'add_notion_task':           return await addNotionTask(input.name, input.notes || '');
     case 'get_stale_leads':           return await getStaleGHLLeads();
-    case 'add_lead':                  return await createGHLLead(input.name, input.phone || '', input.type || '', input.budget || '');
+    case 'add_lead': {
+      const id = queueApproval('add_lead',
+        { name: input.name, phone: input.phone || '', type: input.type || '', budget: input.budget || '' },
+        `NEW LEAD: ${input.name} | ${input.type || 'type unknown'} | ${input.budget || 'budget unknown'}`
+      );
+      return `Queued for approval [ID: ${id}]\n\nAdd to GHL: ${input.name} (${input.type || 'no type'}, ${input.budget || 'no budget'})\n\nReply "approve ${id}" to add or "deny ${id}" to cancel.`;
+    }
     case 'get_whatsapp_inbound':      return getRecentInboundMessages(24);
     case 'get_unanswered_whatsapp':   return getUnansweredMessages();
     case 'get_frameio_uploads':       return await getRecentFrameIOUploads();
@@ -1364,6 +1382,82 @@ function getMemoryContext() {
     return 'Long-term memory:\n' + data.map(m => '- ' + m.fact).join('\n');
   } catch(e) { return ''; }
 }
+// ─── PENDING APPROVALS ────────────────────────────────────────────────────────
+const PENDING_PATH = path.join(__dirname, 'pending-approvals.json');
+
+function loadPending() {
+  try { return JSON.parse(fs.readFileSync(PENDING_PATH)); } catch(e) { return []; }
+}
+
+function queueApproval(type, data, preview) {
+  const pending = loadPending();
+  const id = String(Date.now()).slice(-5); // short 5-digit ID easy to type
+  pending.push({ id, type, data, preview, createdAt: new Date().toISOString() });
+  fs.writeFileSync(PENDING_PATH, JSON.stringify(pending, null, 2));
+  return id;
+}
+
+function getApproval(id) {
+  const pending = loadPending();
+  if (id) return pending.find(p => p.id === String(id));
+  return pending[pending.length - 1] || null;
+}
+
+function removeApproval(id) {
+  const pending = loadPending().filter(p => p.id !== String(id));
+  fs.writeFileSync(PENDING_PATH, JSON.stringify(pending, null, 2));
+}
+
+function listPending() {
+  const pending = loadPending();
+  if (!pending.length) return 'No pending approvals Boss.';
+  return 'Pending approvals:\n' + pending.map(p => `• [${p.id}] ${p.type}: ${p.preview.split('\n')[0]}`).join('\n');
+}
+
+async function executeApproval(item) {
+  switch (item.type) {
+    case 'send_email':             return await sendEmail(item.data.to, item.data.subject, item.data.body);
+    case 'create_calendar_event':  return await createCalendarEvent(item.data.summary, item.data.start, item.data.end, item.data.description || '');
+    case 'add_lead':               return await createGHLLead(item.data.name, item.data.phone || '', item.data.type || '', item.data.budget || '');
+    case 'dev_task':               return await runDevTask(item.data.instruction);
+    default:                       return `Unknown action type: ${item.type}`;
+  }
+}
+
+// ─── DEV MODE ─────────────────────────────────────────────────────────────────
+async function runDevTask(instruction) {
+  let query;
+  try { ({ query } = require('@anthropic-ai/claude-agent-sdk')); }
+  catch(e) { return 'Claude Code SDK not installed Boss. Run: npm install @anthropic-ai/claude-agent-sdk'; }
+
+  let output = '';
+  const toolsUsed = new Set();
+
+  for await (const message of query({
+    prompt: `You are modifying the JT Visuals Chief of Staff server (${path.join(__dirname, 'server.js')}).
+Task: ${instruction}
+Be surgical — only change what is needed. After making changes, summarise what you changed in 2-3 plain text sentences. No markdown.`,
+    options: {
+      cwd: __dirname,
+      allowedTools: ['Read', 'Edit', 'Write', 'Glob', 'Grep'],
+      permissionMode: 'acceptEdits',
+      allowDangerouslySkipPermissions: true,
+      env: { ANTHROPIC_API_KEY: CONFIG.claude.apiKey, ...process.env },
+    }
+  })) {
+    if (message.type === 'assistant') {
+      for (const block of message.message?.content || []) {
+        if ('text' in block && block.text) output += block.text;
+        if ('name' in block) toolsUsed.add(block.name);
+      }
+    }
+  }
+
+  const summary = output.trim().substring(0, 900);
+  const tools = toolsUsed.size ? `\nFiles touched via: ${[...toolsUsed].join(', ')}` : '';
+  return (summary || 'Done Boss.') + tools;
+}
+
 app.post('/chief', async (req, res) => {
   const signature = req.headers['x-twilio-signature'] || '';
   const proto = req.headers['x-forwarded-proto'] || req.protocol;
@@ -1561,6 +1655,39 @@ app.post('/chief', async (req, res) => {
     }
     if (msgLower === 'what do you remember' || msgLower === 'my memory' || msgLower === 'memory') {
       await sendToJackson(getLongtermMemory());
+      return;
+    }
+
+    // ── Pending approvals ─────────────────────────────────────────────────────
+    if (msgLower === 'pending' || msgLower === 'approvals' || msgLower === 'pending approvals') {
+      await sendToJackson(listPending()); return;
+    }
+    if (msgLower.startsWith('approve') || msgLower === 'yes' || msgLower === 'confirm') {
+      const idMatch = incomingMsg.match(/\d{5}/);
+      const item = getApproval(idMatch ? idMatch[0] : null);
+      if (!item) { await sendToJackson('No pending approval found Boss.'); return; }
+      await sendToJackson(`Executing [${item.id}]...`);
+      try {
+        const result = await executeApproval(item);
+        removeApproval(item.id);
+        await sendToJackson(result);
+      } catch(e) { await sendToJackson('Execution failed Boss: ' + e.message); }
+      return;
+    }
+    if (msgLower.startsWith('deny') || msgLower === 'no' || msgLower === 'cancel') {
+      const idMatch = incomingMsg.match(/\d{5}/);
+      const item = getApproval(idMatch ? idMatch[0] : null);
+      if (!item) { await sendToJackson('No pending approval found Boss.'); return; }
+      removeApproval(item.id);
+      await sendToJackson(`Cancelled [${item.id}] — ${item.preview.split('\n')[0]}`);
+      return;
+    }
+
+    // ── Dev mode ──────────────────────────────────────────────────────────────
+    if (msgLower.startsWith('update:') || msgLower.startsWith('dev:') || msgLower.startsWith('build:')) {
+      const instruction = incomingMsg.replace(/^(update|dev|build):\s*/i, '').trim();
+      const id = queueApproval('dev_task', { instruction }, `CODE CHANGE: ${instruction.substring(0, 80)}`);
+      await sendToJackson(`Ready to make this change Boss [ID: ${id}]:\n\n"${instruction}"\n\nReply "approve ${id}" to proceed or "deny ${id}" to cancel.`);
       return;
     }
 
