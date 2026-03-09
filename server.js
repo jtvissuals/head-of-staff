@@ -651,16 +651,26 @@ const SCOPES = ['https://www.googleapis.com/auth/calendar', 'https://www.googlea
 const TOKEN_PATH = path.join(__dirname, 'google-token.json');
 const CREDENTIALS_PATH = path.join(__dirname, 'google-credentials.json');
 
+let _googleAuth = null;
+
 function getGoogleAuth() {
-  if (!fs.existsSync(CREDENTIALS_PATH)) return null;
+  if (!fs.existsSync(CREDENTIALS_PATH) || !fs.existsSync(TOKEN_PATH)) return null;
+  if (_googleAuth) return _googleAuth;
+
   const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH));
   const { client_secret, client_id, redirect_uris } = credentials.installed;
   const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
-  if (fs.existsSync(TOKEN_PATH)) {
-    oAuth2Client.setCredentials(JSON.parse(fs.readFileSync(TOKEN_PATH)));
-    return oAuth2Client;
-  }
-  return null;
+  oAuth2Client.setCredentials(JSON.parse(fs.readFileSync(TOKEN_PATH)));
+
+  // When the library auto-refreshes an expired access token, persist the new token to disk
+  oAuth2Client.on('tokens', (tokens) => {
+    const current = fs.existsSync(TOKEN_PATH) ? JSON.parse(fs.readFileSync(TOKEN_PATH)) : {};
+    fs.writeFileSync(TOKEN_PATH, JSON.stringify({ ...current, ...tokens }, null, 2));
+    console.log('Google token refreshed and saved.');
+  });
+
+  _googleAuth = oAuth2Client;
+  return _googleAuth;
 }
 
 async function authorizeGoogle() {
