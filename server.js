@@ -694,6 +694,174 @@ function getNurtureLeads() {
   }).join('\n');
 }
 
+// ─── ANALYTICS DASHBOARD ──────────────────────────────────────────────────────
+async function getInstagramAnalytics(days = 7) {
+  try {
+    const igCfg = CONFIG.instagram;
+    if (!igCfg?.accessToken || !igCfg?.userId) return '❌ Instagram not connected — ask Jackson to run "connect instagram"';
+    const token = igCfg.accessToken;
+    const userId = igCfg.userId;
+
+    // Account basics
+    const profileRes = await axios.get(`https://graph.facebook.com/v21.0/${userId}`, {
+      params: { fields: 'followers_count,media_count,name,username,biography', access_token: token }
+    });
+    const profile = profileRes.data;
+
+    // Account insights
+    const insightRes = await axios.get(`https://graph.facebook.com/v21.0/${userId}/insights`, {
+      params: {
+        metric: 'reach,impressions,profile_views,follower_count',
+        period: 'day',
+        since: Math.floor((Date.now() - days * 86400000) / 1000),
+        until: Math.floor(Date.now() / 1000),
+        access_token: token
+      }
+    });
+    const insights = {};
+    for (const metric of (insightRes.data?.data || [])) {
+      const total = metric.values.reduce((s, v) => s + (v.value || 0), 0);
+      insights[metric.name] = total;
+    }
+
+    // Recent media performance
+    const mediaRes = await axios.get(`https://graph.facebook.com/v21.0/${userId}/media`, {
+      params: {
+        fields: 'id,caption,media_type,timestamp,like_count,comments_count,insights.metric(reach,impressions,plays)',
+        limit: 10,
+        access_token: token
+      }
+    });
+    const posts = mediaRes.data?.data || [];
+    const topPosts = posts
+      .map(p => ({
+        caption: (p.caption || '').substring(0, 60).replace(/\n/g, ' '),
+        likes: p.like_count || 0,
+        comments: p.comments_count || 0,
+        reach: p.insights?.data?.find(i => i.name === 'reach')?.values?.[0]?.value || 0,
+        plays: p.insights?.data?.find(i => i.name === 'plays')?.values?.[0]?.value || 0,
+        type: p.media_type,
+        date: new Date(p.timestamp).toLocaleDateString('en-AU', { day: 'numeric', month: 'short' })
+      }))
+      .sort((a, b) => b.reach - a.reach);
+
+    let out = `📊 *Instagram Analytics — Last ${days} Days*\n\n`;
+    out += `👤 @${profile.username} | ${profile.followers_count?.toLocaleString()} followers\n`;
+    out += `📸 ${profile.media_count} total posts\n\n`;
+    out += `*Performance:*\n`;
+    out += `• Reach: ${(insights.reach || 0).toLocaleString()}\n`;
+    out += `• Impressions: ${(insights.impressions || 0).toLocaleString()}\n`;
+    out += `• Profile views: ${(insights.profile_views || 0).toLocaleString()}\n\n`;
+
+    if (topPosts.length) {
+      out += `*Top posts this period:*\n`;
+      topPosts.slice(0, 3).forEach((p, i) => {
+        out += `${i + 1}. ${p.type === 'VIDEO' ? '🎬' : '📸'} ${p.caption || '(no caption)'}...\n`;
+        out += `   ❤️ ${p.likes} | 💬 ${p.comments} | 👁️ ${p.reach.toLocaleString()} reach${p.plays ? ` | ▶️ ${p.plays.toLocaleString()} plays` : ''} (${p.date})\n`;
+      });
+    }
+    return out;
+  } catch (e) {
+    if (e.response?.data?.error) return `Instagram API error: ${e.response.data.error.message}`;
+    return `Instagram error: ${e.message}`;
+  }
+}
+
+async function getTikTokAnalytics() {
+  try {
+    const ttCfg = CONFIG.tiktok;
+    if (!ttCfg?.accessToken) return '❌ TikTok not connected — ask Jackson to run "connect tiktok"';
+
+    // TikTok Business API v2
+    const userRes = await axios.get('https://business-api.tiktok.com/open_api/v1.3/bc/user/info/', {
+      headers: { 'Access-Token': ttCfg.accessToken }
+    });
+
+    // Video list for engagement stats
+    const videoRes = await axios.post('https://business-api.tiktok.com/open_api/v1.3/research/video/query/', {
+      filters: {
+        video_ids: []
+      },
+      fields: ['video_id', 'create_time', 'like_count', 'comment_count', 'share_count', 'view_count']
+    }, {
+      headers: { 'Access-Token': ttCfg.accessToken, 'Content-Type': 'application/json' }
+    });
+
+    const user = userRes.data?.data;
+    let out = `📱 *TikTok Analytics*\n\n`;
+    if (user) {
+      out += `👤 @${user.username || 'unknown'} | ${(user.follower_count || 0).toLocaleString()} followers\n`;
+      out += `❤️ ${(user.likes_count || 0).toLocaleString()} total likes\n`;
+    }
+    return out;
+  } catch (e) {
+    if (e.response?.status === 401) return '❌ TikTok token expired — run "connect tiktok" to re-auth';
+    return `TikTok error: ${e.message}`;
+  }
+}
+
+async function getFullAnalyticsDashboard(days = 7) {
+  const [igReport, ttReport] = await Promise.allSettled([
+    getInstagramAnalytics(days),
+    getTikTokAnalytics()
+  ]);
+  let out = '';
+  out += igReport.status === 'fulfilled' ? igReport.value : `Instagram: ${igReport.reason?.message}`;
+  out += '\n\n';
+  out += ttReport.status === 'fulfilled' ? ttReport.value : `TikTok: ${ttReport.reason?.message}`;
+  return out;
+}
+
+async function sendWeeklyAnalyticsReport() {
+  try {
+    const report = await getFullAnalyticsDashboard(7);
+    await sendWhatsApp(`📊 *Weekly Analytics Report — ${new Date().toLocaleDateString('en-AU', { weekday: 'long', day: 'numeric', month: 'long' })}*\n\n${report}`);
+  } catch (e) { console.error('Weekly analytics report error:', e.message); }
+}
+
+async function connectInstagram(accessToken) {
+  try {
+    // Get user ID from token
+    const res = await axios.get('https://graph.facebook.com/v21.0/me/accounts', {
+      params: { access_token: accessToken, fields: 'id,name,instagram_business_account' }
+    });
+    const pages = res.data?.data || [];
+    const pageWithIg = pages.find(p => p.instagram_business_account);
+    if (!pageWithIg) return '❌ No Instagram Business Account found linked to this Facebook Page token. Make sure your Instagram is connected to a Facebook Page in Meta Business Suite.';
+
+    const igUserId = pageWithIg.instagram_business_account.id;
+    // Get a long-lived page token
+    const pageTokenRes = await axios.get(`https://graph.facebook.com/v21.0/${pageWithIg.id}`, {
+      params: { fields: 'access_token', access_token: accessToken }
+    });
+    const pageToken = pageTokenRes.data?.access_token || accessToken;
+
+    // Get long-lived token
+    const llRes = await axios.get('https://graph.facebook.com/v21.0/oauth/access_token', {
+      params: {
+        grant_type: 'fb_exchange_token',
+        client_id: CONFIG.instagram?.appId || '',
+        client_secret: CONFIG.instagram?.appSecret || '',
+        fb_exchange_token: pageToken
+      }
+    });
+    const longToken = llRes.data?.access_token || pageToken;
+
+    // Verify it works
+    const profileRes = await axios.get(`https://graph.facebook.com/v21.0/${igUserId}`, {
+      params: { fields: 'username,followers_count', access_token: longToken }
+    });
+    const profile = profileRes.data;
+
+    CONFIG.instagram = { ...CONFIG.instagram, userId: igUserId, accessToken: longToken };
+    fs.writeFileSync(path.join(__dirname, 'config.json'), JSON.stringify(CONFIG, null, 2));
+    return `✅ Instagram connected! @${profile.username} — ${profile.followers_count?.toLocaleString()} followers`;
+  } catch (e) {
+    if (e.response?.data?.error) return `❌ ${e.response.data.error.message}`;
+    return `❌ Error: ${e.message}`;
+  }
+}
+
 // ─── MONDAY.COM ───────────────────────────────────────────────────────────────
 const MONDAY_BOARD_NAMES = {
   jackson: 'Jackson Tasks',
@@ -1578,6 +1746,12 @@ const TOOLS = [
   { name: 'generate_hooks',          description: 'Generate video hook lines for a topic',
     input_schema: { type: 'object', required: ['topic'], properties: { topic: { type: 'string' }, count: { type: 'number' } } }
   },
+  { name: 'get_analytics',           description: 'Get Instagram and TikTok analytics dashboard — follower count, reach, impressions, top posts',
+    input_schema: { type: 'object', properties: { days: { type: 'number', description: 'Number of days to look back (default 7)' }, platform: { type: 'string', description: '"instagram", "tiktok", or "all" (default all)' } }, required: [] }
+  },
+  { name: 'connect_instagram',       description: 'Connect Instagram Business account using a Meta access token',
+    input_schema: { type: 'object', required: ['access_token'], properties: { access_token: { type: 'string' } } }
+  },
   { name: 'generate_caption',        description: 'Write an Instagram caption for a client',
     input_schema: { type: 'object', required: ['topic'], properties: { topic: { type: 'string' }, client: { type: 'string' } } }
   },
@@ -1676,6 +1850,14 @@ async function executeTool(name, input) {
     case 'draft_client_reply':        return await draftClientReply(input.client, input.question);
     case 'generate_reel_ideas':       return await generateReelIdeas(input.client, input.count || 8);
     case 'generate_hooks':            return await generateHooks(input.topic, input.count || 8);
+    case 'get_analytics': {
+      const days = input.days || 7;
+      const platform = (input.platform || 'all').toLowerCase();
+      if (platform === 'instagram') return await getInstagramAnalytics(days);
+      if (platform === 'tiktok') return await getTikTokAnalytics();
+      return await getFullAnalyticsDashboard(days);
+    }
+    case 'connect_instagram':         return await connectInstagram(input.access_token);
     case 'generate_caption':          return await generateCaption(input.topic, input.client || '');
     case 'generate_content_calendar': return await generateContentCalendar(input.client);
     case 'update_config':             return updateConfig(input.key, input.value);
@@ -2793,6 +2975,11 @@ app.listen(PORT, async () => {
   scheduleDaily(() => 13, () => 0, checkClientGroupTasks, 'Afternoon Group Task Scan');
   scheduleDaily(() => 17, () => 0, checkClientGroupTasks, 'Evening Group Task Scan');
   scheduleDaily(() => 21, () => 0, checkClientGroupTasks, 'Night Group Task Scan');
+
+  // Weekly analytics report — every Monday at 8am
+  scheduleDaily(() => 8, () => 0, async () => {
+    if (new Date().getDay() === 1) await sendWeeklyAnalyticsReport();
+  }, 'Weekly Analytics Report (Monday)');
 
   console.log('\nChief of Staff v4 ready!');
   console.log('NEW: wins | log win: Client, package, $value');
