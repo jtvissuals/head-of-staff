@@ -503,46 +503,94 @@ HOT LEAD: fitness/online coach, $2k+/month budget. WARM: $1-2k. PASS: under $1k.
 ALWAYS check with Jackson before sending any quote.
 `;
 
-// ─── FATHOM ───────────────────────────────────────────────────────────────────
-const FATHOM_API_KEY = process.env.FATHOM_API_KEY || CONFIG.fathom?.apiKey || '';
-
-async function getFathomMeetings(limit = 20) {
-  try {
-    const res = await axios.get('https://api.fathom.video/v1/calls', {
-      headers: { 'Authorization': `Bearer ${FATHOM_API_KEY}` }, params: { limit }
-    });
-    return res.data?.calls || res.data?.data || res.data || [];
-  } catch(e) { return []; }
+// ─── FIREFLIES ────────────────────────────────────────────────────────────────
+function firefliesQuery(query, variables = {}) {
+  return axios.post('https://api.fireflies.ai/graphql',
+    { query, variables },
+    { headers: { 'Authorization': `Bearer ${CONFIG.fireflies?.apiKey || ''}`, 'Content-Type': 'application/json' } }
+  );
 }
 
-async function getFathomTranscript(callId) {
+async function getFirefliesCalls(limit = 10) {
   try {
-    const res = await axios.get(`https://api.fathom.video/v1/calls/${callId}/transcript`, {
-      headers: { 'Authorization': `Bearer ${FATHOM_API_KEY}` }
-    });
-    return res.data;
+    const res = await firefliesQuery(`{
+      transcripts(limit: ${limit}) {
+        id title date duration
+        summary { overview action_items keywords }
+        sentences { text speaker_name }
+      }
+    }`);
+    return res.data?.data?.transcripts || [];
+  } catch(e) { console.error('Fireflies error:', e.response?.data || e.message); return []; }
+}
+
+async function getFirefliesTranscript(id) {
+  try {
+    const res = await firefliesQuery(`{
+      transcript(id: "${id}") {
+        id title date duration
+        summary { overview action_items keywords }
+        sentences { text speaker_name }
+      }
+    }`);
+    return res.data?.data?.transcript || null;
   } catch(e) { return null; }
 }
 
 async function analysePastCalls() {
-  const meetings = await getFathomMeetings(30);
-  if (!meetings.length) return 'No Fathom calls found Boss. Make sure Fathom is recording your sales calls.';
-  const transcripts = [];
-  for (const meeting of meetings.slice(0, 8)) {
-    const t = await getFathomTranscript(meeting.id);
-    if (t) transcripts.push({
-      title: meeting.title || meeting.name || 'Untitled',
-      date: meeting.started_at || meeting.created_at,
-      summary: meeting.summary || '',
-      transcript: (typeof t === 'string' ? t : JSON.stringify(t)).substring(0, 600)
-    });
-  }
-  if (!transcripts.length) return 'Recent calls:\n' + meetings.slice(0, 8).map(m => `• ${m.title || 'Untitled'} — ${new Date(m.started_at || m.created_at).toLocaleDateString('en-AU')}`).join('\n');
+  const calls = await getFirefliesCalls(10);
+  if (!calls.length) return 'No Fireflies calls found Boss. Make sure Fireflies is connected to your calendar.';
+
+  const callData = calls.map(c => {
+    const overview = c.summary?.overview || '';
+    const transcript = (c.sentences || []).slice(0, 40).map(s => `${s.speaker_name}: ${s.text}`).join(' ');
+    return `CALL: ${c.title} (${new Date(c.date).toLocaleDateString('en-AU')})\nSUMMARY: ${overview}\nTRANSCRIPT: ${transcript}`;
+  }).join('\n\n');
+
   const prompt = `Analyse these sales calls for Jackson Edwards, JT Visuals videography agency Gold Coast.
-Calls: ${transcripts.map(t => `${t.title} (${new Date(t.date).toLocaleDateString('en-AU')}): ${t.summary} ${t.transcript}`).join(' | ')}
-Tell Boss: 1) Most discussed packages 2) Common objections 3) What closes deals 4) Patterns in wins vs losses. Max 5 lines.`;
+${JT_PRICING}
+CALLS:
+${callData}
+
+Give Boss:
+1) Which packages came up most
+2) Top 3 objections and how to handle them
+3) What specifically closes deals
+4) Win vs loss patterns
+5) One thing to do differently on next call
+Plain text, no markdown, max 8 lines.`;
+
   const r = await axios.post('https://api.anthropic.com/v1/messages',
-    { model: MODEL_MID, max_tokens: 400, messages: [{ role: 'user', content: prompt }] },
+    { model: MODEL_MID, max_tokens: 600, messages: [{ role: 'user', content: prompt }] },
+    { headers: { 'x-api-key': CONFIG.claude.apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' } });
+  return r.data.content[0].text;
+}
+
+async function analyseFirefliesCall(transcript) {
+  const overview = transcript.summary?.overview || '';
+  const sentences = (transcript.sentences || []).map(s => `${s.speaker_name}: ${s.text}`).join('\n');
+  const actionItems = transcript.summary?.action_items || '';
+
+  const prompt = `Jackson Edwards just finished a sales call. Analyse it and give him a debrief.
+CALL: ${transcript.title}
+SUMMARY: ${overview}
+ACTION ITEMS: ${actionItems}
+TRANSCRIPT:
+${sentences.substring(0, 3000)}
+
+JT VISUALS PRICING:
+${JT_PRICING}
+
+Give Boss:
+1) Did they close or not — why
+2) Key objections raised
+3) Best package to follow up with and why
+4) Exact follow-up message to send (WhatsApp style, casual, under 3 sentences)
+5) One thing Jackson handled well, one to improve
+Plain text, no markdown, max 10 lines.`;
+
+  const r = await axios.post('https://api.anthropic.com/v1/messages',
+    { model: MODEL_MID, max_tokens: 600, messages: [{ role: 'user', content: prompt }] },
     { headers: { 'x-api-key': CONFIG.claude.apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' } });
   return r.data.content[0].text;
 }
@@ -1075,6 +1123,7 @@ async function doMarketResearch() {
 // ─── AGENT TOOLS ──────────────────────────────────────────────────────────────
 const TOOLS = [
   { name: 'get_mrr',                 description: 'Get current MRR breakdown across all active clients', input_schema: { type: 'object', properties: {}, required: [] } },
+  { name: 'analyse_calls',           description: 'Analyse recent Fireflies sales calls for patterns, objections, and what closes deals', input_schema: { type: 'object', properties: {}, required: [] } },
   { name: 'get_calendar',            description: "Get today's calendar events", input_schema: { type: 'object', properties: {}, required: [] } },
   { name: 'get_yesterday_events',    description: "Get yesterday's calendar events", input_schema: { type: 'object', properties: {}, required: [] } },
   { name: 'schedule_appointment',    description: 'Schedule a call or appointment — books in GHL CRM and Google Calendar simultaneously. Use this for any "schedule a call", "book a meeting", "set up a time" request.',
@@ -1157,6 +1206,7 @@ const TOOLS = [
 async function executeTool(name, input) {
   switch (name) {
     case 'get_mrr':                   return getMRR();
+    case 'analyse_calls':             return await analysePastCalls();
     case 'get_calendar':              return await getCalendarEvents();
     case 'get_yesterday_events':      return await getYesterdayEvents();
     case 'schedule_appointment': {
@@ -1806,6 +1856,31 @@ app.post('/chief', async (req, res) => {
 });
 
 app.get('/', (req, res) => res.send('JT Visuals Chief of Staff v4'));
+
+// ─── FIREFLIES WEBHOOK ────────────────────────────────────────────────────────
+app.post('/fireflies-webhook', async (req, res) => {
+  res.status(200).send('OK');
+  try {
+    const { meetingId, title } = req.body;
+    if (!meetingId) return;
+    console.log('Fireflies webhook received:', meetingId, title);
+
+    // Small delay to let Fireflies finish processing
+    await new Promise(r => setTimeout(r, 5000));
+
+    const transcript = await getFirefliesTranscript(meetingId);
+    if (!transcript) {
+      await sendToJackson(`Call finished: ${title || meetingId}. Transcript not ready yet — try "analyse my calls" in a few minutes.`);
+      return;
+    }
+
+    await sendToJackson(`Call debrief — ${transcript.title || title}:`);
+    const analysis = await analyseFirefliesCall(transcript);
+    await sendToJackson(analysis);
+  } catch(e) {
+    console.error('Fireflies webhook error:', e.message);
+  }
+});
 
 app.get('/frameio/auth', (req, res) => {
   const url = `https://ims-na1.adobelogin.com/ims/authorize/v2?client_id=${FRAMEIO_CLIENT_ID}&redirect_uri=${encodeURIComponent(FRAMEIO_REDIRECT)}&scope=openid,email,profile,offline_access&response_type=code`;
