@@ -28,7 +28,7 @@ function loadConfig() {
       apiKey: process.env.ANTHROPIC_API_KEY || '',
     },
     notion: { apiKey: process.env.NOTION_API_KEY || '' },
-    ghl: { apiKey: process.env.GHL_API_KEY || '', locationId: process.env.GHL_LOCATION_ID || '' },
+    ghl: { apiKey: process.env.GHL_API_KEY || '', locationId: process.env.GHL_LOCATION_ID || '', calendarId: process.env.GHL_CALENDAR_ID || '' },
     fathom: { apiKey: process.env.FATHOM_API_KEY || '' },
     frameio: { apiKey: '', clientId: process.env.FRAMEIO_CLIENT_ID || '', clientSecret: process.env.FRAMEIO_CLIENT_SECRET || '', redirect: process.env.FRAMEIO_REDIRECT || '' },
     owner: {
@@ -146,6 +146,9 @@ const JT_BUSINESS_CLIENTS = [
   { name: 'Jess Richards', niche: 'podcast/content', package: '1x podcast/week + 1x reel', value: '$1,000/month' },
   { name: 'CoreCoach', niche: 'fitness app', package: '24x short form/month', value: '$3,900/month' },
   { name: 'Morgan', niche: 'podcast', package: '1x podcast/week', value: '$350/week' },
+  { name: 'Kingbodies', niche: 'fitness coaching', package: '15 videos/month', value: '$2,700/month' },
+  { name: 'Harry Drew', niche: 'fitness coaching', package: '10 videos/month', value: '$1,900/month' },
+  { name: 'Pantry Girl', niche: 'food/lifestyle', package: '10 videos/month', value: '$2,200/month' },
 ];
 
 // ─── WIN TRACKER ──────────────────────────────────────────────────────────────
@@ -877,6 +880,72 @@ async function createGHLLead(name, phone, type, budget) {
   } catch(e) { return 'GHL error: ' + e.message; }
 }
 
+async function getGHLCalendars() {
+  try {
+    const res = await axios.get(`https://services.leadconnectorhq.com/calendars/?locationId=${CONFIG.ghl.locationId}`, { headers: { 'Authorization': `Bearer ${CONFIG.ghl.apiKey}`, 'Version': '2021-07-28' } });
+    return res.data.calendars || [];
+  } catch(e) { return []; }
+}
+
+async function findOrCreateGHLContact(name, phone, email) {
+  const headers = { 'Authorization': `Bearer ${CONFIG.ghl.apiKey}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' };
+  // Search by name
+  try {
+    const res = await axios.get(`https://services.leadconnectorhq.com/contacts/`, {
+      headers,
+      params: { locationId: CONFIG.ghl.locationId, query: name, limit: 5 }
+    });
+    const contacts = res.data?.contacts || [];
+    if (contacts.length > 0) {
+      console.log('GHL contact found:', contacts[0].id, contacts[0].firstName);
+      return contacts[0].id;
+    }
+  } catch(e) { console.error('GHL contact search error:', e.response?.data || e.message); }
+
+  // Create contact
+  try {
+    const body = { locationId: CONFIG.ghl.locationId, firstName: name.split(' ')[0], lastName: name.split(' ').slice(1).join(' ') || '' };
+    if (phone) body.phone = phone;
+    if (email) body.email = email;
+    const res = await axios.post('https://services.leadconnectorhq.com/contacts/', body, { headers });
+    const id = res.data?.contact?.id || res.data?.id;
+    console.log('GHL contact created:', id);
+    return id || null;
+  } catch(e) {
+    console.error('GHL contact create error:', e.response?.data || e.message);
+    return null;
+  }
+}
+
+async function getGHLUserId() {
+  if (CONFIG.ghl.userId) return CONFIG.ghl.userId;
+  try {
+    const res = await axios.get(`https://services.leadconnectorhq.com/users/?locationId=${CONFIG.ghl.locationId}`, {
+      headers: { 'Authorization': `Bearer ${CONFIG.ghl.apiKey}`, 'Version': '2021-07-28' }
+    });
+    const users = res.data?.users || [];
+    if (users.length) {
+      CONFIG.ghl.userId = users[0].id;
+      saveConfig(CONFIG);
+      console.log('GHL userId cached:', CONFIG.ghl.userId);
+      return CONFIG.ghl.userId;
+    }
+  } catch(e) { console.error('GHL user fetch error:', e.response?.data || e.message); }
+  return null;
+}
+
+
+async function addGHLContactNote(contactId, note) {
+  try {
+    await axios.post(`https://services.leadconnectorhq.com/contacts/${contactId}/notes`, { body: note }, {
+      headers: { 'Authorization': `Bearer ${CONFIG.ghl.apiKey}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' }
+    });
+    console.log('GHL note added to contact:', contactId);
+  } catch(e) {
+    console.error('GHL note error:', e.response?.data || e.message);
+  }
+}
+
 // ─── FRAME.IO V4 OAuth ────────────────────────────────────────────────────────
 const FRAMEIO_CLIENT_ID = process.env.FRAMEIO_CLIENT_ID || CONFIG.frameio?.clientId || '';
 const FRAMEIO_CLIENT_SECRET = process.env.FRAMEIO_CLIENT_SECRET || CONFIG.frameio?.clientSecret || '';
@@ -962,8 +1031,8 @@ ${writingStyle ? writingStyle.substring(0, 800) : 'Casual, direct, professional 
 JT VISUALS PRICING:
 ${JT_PRICING}
 
-ACTIVE CLIENTS (these are the ONLY 9 clients — never invent others):
-Alpha Physiques, Hattie (Flex Method), Cade, Jese Smith, Sarah, Raw Reality, Jess Richards, CoreCoach, Morgan
+ACTIVE CLIENTS (these are the ONLY 12 clients — never invent others):
+Alpha Physiques, Hattie (Flex Method), Cade, Jese Smith, Sarah, Raw Reality, Jess Richards, CoreCoach, Morgan, Kingbodies, Harry Drew, Pantry Girl
 
 STRICT RULES — violating any of these is a failure:
 - Always call Jackson "Boss". Never "Jackson" in replies.
@@ -1005,9 +1074,20 @@ async function doMarketResearch() {
 
 // ─── AGENT TOOLS ──────────────────────────────────────────────────────────────
 const TOOLS = [
+  { name: 'get_mrr',                 description: 'Get current MRR breakdown across all active clients', input_schema: { type: 'object', properties: {}, required: [] } },
   { name: 'get_calendar',            description: "Get today's calendar events", input_schema: { type: 'object', properties: {}, required: [] } },
   { name: 'get_yesterday_events',    description: "Get yesterday's calendar events", input_schema: { type: 'object', properties: {}, required: [] } },
-  { name: 'create_calendar_event',   description: 'Create a Google Calendar event',
+  { name: 'schedule_appointment',    description: 'Schedule a call or appointment — books in GHL CRM and Google Calendar simultaneously. Use this for any "schedule a call", "book a meeting", "set up a time" request.',
+    input_schema: { type: 'object', required: ['title','start','end'], properties: {
+      title:        { type: 'string', description: 'e.g. "Sales call with John Smith"' },
+      start:        { type: 'string', description: 'ISO 8601 datetime e.g. 2026-03-11T10:00:00' },
+      end:          { type: 'string', description: 'ISO 8601 datetime' },
+      contact_name: { type: 'string', description: 'Name of the person the call is with' },
+      contact_phone:{ type: 'string' },
+      notes:        { type: 'string' }
+    }}
+  },
+  { name: 'create_calendar_event',   description: 'Create a Google Calendar event. Only use this if Boss explicitly says "add to Google Calendar". For all calls, shoots, and client meetings use schedule_appointment instead.',
     input_schema: { type: 'object', required: ['summary','start','end'], properties: {
       summary:     { type: 'string' },
       start:       { type: 'string', description: 'ISO 8601 datetime e.g. 2026-03-11T10:00:00' },
@@ -1076,15 +1156,20 @@ const TOOLS = [
 // ─── TOOL EXECUTOR ────────────────────────────────────────────────────────────
 async function executeTool(name, input) {
   switch (name) {
+    case 'get_mrr':                   return getMRR();
     case 'get_calendar':              return await getCalendarEvents();
     case 'get_yesterday_events':      return await getYesterdayEvents();
-    case 'create_calendar_event': {
-      const id = queueApproval('create_calendar_event',
-        { summary: input.summary, start: input.start, end: input.end, description: input.description || '' },
-        `EVENT: ${input.summary}\nSTART: ${input.start}\nEND: ${input.end}`
-      );
-      return `Queued for approval [ID: ${id}]\n\nCalendar event: ${input.summary}\nStart: ${input.start}\nEnd: ${input.end}\n\nReply "approve ${id}" to create or "deny ${id}" to cancel.`;
+    case 'schedule_appointment': {
+      const contactId = input.contact_name ? await findOrCreateGHLContact(input.contact_name, input.contact_phone || '', '') : null;
+      const calResult = await createCalendarEvent(input.title, input.start, input.end, input.notes || '');
+      if (contactId) {
+        const readableTime = new Date(input.start).toLocaleString('en-AU', { timeZone: CONFIG.owner.timezone, weekday: 'long', day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit', hour12: true });
+        await addGHLContactNote(contactId, `📅 Call scheduled: ${input.title} on ${readableTime}`);
+      }
+      return `Booked: ${input.title} at ${input.start}. Added to Google Calendar${contactId ? ' and noted on GHL contact' : ''}.`;
     }
+    case 'create_calendar_event':
+      return await createCalendarEvent(input.summary, input.start, input.end, input.description || '');
     case 'get_emails':                return await getUnreadEmails(input.max || 8);
     case 'draft_email_replies':       return await draftAllUnreadReplies();
     case 'send_email': {
@@ -1158,7 +1243,11 @@ async function executeTool(name, input) {
 async function runAgentLoop(userMessage) {
   const writingStyle = getJacksonWritingStyle();
   const memoryContext = getMemoryContext();
+  const nowBrisbane = new Intl.DateTimeFormat('en-AU', { timeZone: 'Australia/Brisbane', weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: true }).format(new Date());
   const system = `You are the AI Chief of Staff for Jackson Edwards, owner of JT Visuals videography agency in Gold Coast, Australia.
+
+CURRENT DATE/TIME (Brisbane): ${nowBrisbane}
+When scheduling anything, always use this as "now" and calculate dates from it. Never guess the year.
 
 JACKSON'S WRITING STYLE:
 ${writingStyle ? writingStyle.substring(0, 800) : 'Casual, direct, professional but friendly.'}
@@ -1166,8 +1255,8 @@ ${writingStyle ? writingStyle.substring(0, 800) : 'Casual, direct, professional 
 JT VISUALS PRICING:
 ${JT_PRICING}
 
-ACTIVE CLIENTS (these are the ONLY 9 clients — never invent others):
-Alpha Physiques, Hattie (Flex Method), Cade, Jese Smith, Sarah, Raw Reality, Jess Richards, CoreCoach, Morgan
+ACTIVE CLIENTS (these are the ONLY 12 clients — never invent others):
+Alpha Physiques, Hattie (Flex Method), Cade, Jese Smith, Sarah, Raw Reality, Jess Richards, CoreCoach, Morgan, Kingbodies, Harry Drew, Pantry Girl
 
 STRICT RULES — violating any of these is a failure:
 - Always call Jackson "Boss". Never "Jackson" in replies.
@@ -1186,6 +1275,7 @@ STRICT RULES — violating any of these is a failure:
 - Professional but warm — trusted EA, not a robot and not a life coach.
 - Use tools to fetch live data before answering questions about calendar, emails, tasks, leads, etc. Never make up data.
 - For multi-step requests, chain tools in sequence without asking for confirmation between steps — except before send_email.
+- When Boss asks to schedule or book anything, call schedule_appointment IMMEDIATELY with the time Boss specified. NEVER check calendar availability first. NEVER say a time is busy. Just book it.
 ${memoryContext ? '\n' + memoryContext : ''}`;
 
   const history = loadMemory();
@@ -1360,6 +1450,9 @@ const ACTIVE_CLIENTS_MRR = [
   { name: "Jess Richards", mrr: 1000 },
   { name: "CoreCoach", mrr: 3900 },
   { name: "Morgan", mrr: 1517 },        // $350/week × 52/12
+  { name: "Kingbodies", mrr: 2700 },
+  { name: "Harry Drew", mrr: 1900 },
+  { name: "Pantry Girl", mrr: 2200 },
 ];
 function getMRR() {
   const mrr = ACTIVE_CLIENTS_MRR.reduce((sum, c) => sum + c.mrr, 0);
