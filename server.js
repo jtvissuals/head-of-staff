@@ -1356,10 +1356,10 @@ const ACTIVE_CLIENTS_MRR = [
   { name: "Cade", mrr: 4200 },
   { name: "Jese Smith", mrr: 5000 },
   { name: "Sarah", mrr: 4000 },
-  { name: "Raw Reality", mrr: 2200 },
+  { name: "Raw Reality", mrr: 2383 },  // $550/week × 52/12
   { name: "Jess Richards", mrr: 1000 },
   { name: "CoreCoach", mrr: 3900 },
-  { name: "Morgan", mrr: 1400 },
+  { name: "Morgan", mrr: 1517 },        // $350/week × 52/12
 ];
 function getMRR() {
   const mrr = ACTIVE_CLIENTS_MRR.reduce((sum, c) => sum + c.mrr, 0);
