@@ -129,6 +129,14 @@ function getUnansweredMessages() {
 }
 
 function getJacksonWritingStyle() {
+  const stylePath = path.join(__dirname, 'writing-style.json');
+  if (fs.existsSync(stylePath)) {
+    try {
+      const data = JSON.parse(fs.readFileSync(stylePath));
+      return data.profile || '';
+    } catch(e) {}
+  }
+  // Fallback to live messages if profile not built yet
   const sql = `SELECT ZTEXT FROM ZWAMESSAGE WHERE ZISFROMME=1 AND ZTEXT IS NOT NULL AND LENGTH(ZTEXT) > 10 ORDER BY ZMESSAGEDATE DESC LIMIT 50;`;
   const raw = queryWhatsApp(sql);
   if (!raw) return '';
@@ -842,19 +850,43 @@ async function getSentEmailStyle(max = 20) {
   return samples.filter(Boolean).join('\n---\n');
 }
 
+function getEmailStyle() {
+  const stylePath = path.join(__dirname, 'writing-style.json');
+  if (fs.existsSync(stylePath)) {
+    try {
+      const data = JSON.parse(fs.readFileSync(stylePath));
+      return data.emailProfile || '';
+    } catch(e) {}
+  }
+  return '';
+}
+
 async function draftEmailReply(fromEmail, subject, emailBody) {
-  const sentStyle = await getSentEmailStyle(15);
+  const emailStyle = getEmailStyle();
   const waStyle = getJacksonWritingStyle();
-  const prompt = `Draft an email reply on behalf of Jackson Edwards, JT Visuals (info@jtvissuals.com.au), Gold Coast.
-JACKSON'S EMAIL STYLE:\n${sentStyle.substring(0, 1000)}
-JACKSON'S TONE (WhatsApp):\n${waStyle.substring(0, 300)}
-Reply to:
+  const prompt = `Draft an email reply on behalf of Jackson Edwards, JT Visuals (info@jtvissuals.com.au), Gold Coast Australia.
+
+JACKSON'S EMAIL STYLE PROFILE:
+${emailStyle.substring(0, 2000)}
+
+JACKSON'S WHATSAPP TONE (for reference):
+${waStyle.substring(0, 400)}
+
+EMAIL TO REPLY TO:
 FROM: ${fromEmail}
 SUBJECT: ${subject}
 EMAIL: ${emailBody}
-Write ONLY the email body. Sign off as Jackson Edwards, JT Visuals. Professional but warm.`;
+
+Rules:
+- Open with "Hey [first name]!" unless it's formal/complaint — then "Hey [first name],"
+- Short paragraphs, get to the point fast
+- Sign off with just "Jackson"
+- No "Kind regards", no filler openers like "Hope you're well"
+- Sound like him, not like a corporate email bot
+- Write ONLY the email body, nothing else`;
+
   const response = await axios.post('https://api.anthropic.com/v1/messages',
-    { model: MODEL_MID, max_tokens: 500, messages: [{ role: 'user', content: prompt }] },
+    { model: MODEL_MID, max_tokens: 600, messages: [{ role: 'user', content: prompt }] },
     { headers: { 'x-api-key': CONFIG.claude.apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' } });
   return response.data.content[0].text;
 }
@@ -1477,6 +1509,93 @@ async function sendCheckinPrompts() {
   await sendToJackson(`30-day check-ins due Boss 👥\n\n${lines.join('\n')}\n\nSay "checked in with [name]" to mark done.`);
 }
 
+// ─── UNANSWERED CLIENT MESSAGE CHECKER (every 5 mins) ────────────────────────
+const ALERTED_MESSAGES_PATH = path.join(__dirname, 'alerted-messages.json');
+
+function loadAlertedMessages() {
+  if (fs.existsSync(ALERTED_MESSAGES_PATH)) {
+    try { return new Set(JSON.parse(fs.readFileSync(ALERTED_MESSAGES_PATH))); } catch(e) {}
+  }
+  return new Set();
+}
+
+function saveAlertedMessages(set) {
+  // Keep only last 500 to prevent file bloat
+  const arr = [...set].slice(-500);
+  fs.writeFileSync(ALERTED_MESSAGES_PATH, JSON.stringify(arr));
+}
+
+function getUnansweredClientMessages() {
+  const oneHourAgoCoreData = (Date.now() / 1000 - 3600) - 978307200;
+  const twoDaysAgoCoreData = (Date.now() / 1000 - 172800) - 978307200;
+
+  // Get last message in each chat — flag ones where last msg is FROM them, older than 1hr
+  const sql = `SELECT m.Z_PK, COALESCE(s.ZPARTNERNAME, m.ZPUSHNAME, '') as name, m.ZTEXT, m.ZMESSAGEDATE
+    FROM ZWAMESSAGE m
+    LEFT JOIN ZWACHATSESSION s ON m.ZCHATSESSION = s.Z_PK
+    WHERE m.ZMESSAGEDATE = (SELECT MAX(ZMESSAGEDATE) FROM ZWAMESSAGE m2 WHERE m2.ZCHATSESSION = m.ZCHATSESSION)
+    AND m.ZISFROMME = 0
+    AND m.ZTEXT IS NOT NULL AND m.ZTEXT != ''
+    AND m.ZMESSAGEDATE < ${oneHourAgoCoreData}
+    AND m.ZMESSAGEDATE > ${twoDaysAgoCoreData}
+    ORDER BY m.ZMESSAGEDATE DESC LIMIT 30;`;
+
+  const raw = queryWhatsApp(sql);
+  if (!raw) return [];
+
+  const clientNames = JT_BUSINESS_CLIENTS.map(c => c.name.toLowerCase());
+
+  return raw.split('\n').map(line => {
+    const parts = line.split('|');
+    return { pk: parts[0]?.trim(), name: parts[1]?.trim(), text: parts[2]?.trim(), ts: parseFloat(parts[3]) };
+  }).filter(m => {
+    if (!m.name || !m.text || !m.pk) return false;
+    const nameLower = m.name.toLowerCase();
+    return clientNames.some(cn => nameLower.includes(cn.split(' ')[0].toLowerCase()));
+  });
+}
+
+async function checkUnansweredClientMessages() {
+  try {
+    const messages = getUnansweredClientMessages();
+    if (!messages.length) return;
+
+    const alerted = loadAlertedMessages();
+    const newMessages = messages.filter(m => !alerted.has(m.pk));
+    if (!newMessages.length) return;
+
+    const writingStyle = getJacksonWritingStyle();
+
+    for (const msg of newMessages) {
+      const client = JT_BUSINESS_CLIENTS.find(c => msg.name.toLowerCase().includes(c.name.split(' ')[0].toLowerCase()));
+      const hoursAgo = Math.round((Date.now() / 1000 - (msg.ts + 978307200)) / 3600 * 10) / 10;
+
+      const prompt = `Draft a short WhatsApp reply from Jackson Edwards to ${msg.name} (${client?.niche || 'client'}, package: ${client?.package || 'content creation'}).
+Their message: "${msg.text}"
+Jackson's writing style (recent messages): ${writingStyle ? writingStyle.substring(0, 400) : 'Casual, direct, friendly'}
+Rules: Sound exactly like Jackson. Casual Australian tone. Under 2 sentences. No emojis unless Jackson uses them. Just the reply text, nothing else.`;
+
+      const r = await axios.post('https://api.anthropic.com/v1/messages',
+        { model: MODEL_LOW, max_tokens: 150, messages: [{ role: 'user', content: prompt }] },
+        { headers: { 'x-api-key': CONFIG.claude.apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' } });
+
+      const draft = r.data.content[0].text;
+      await sendToJackson(`${msg.name} (${hoursAgo}h ago): "${msg.text}"\n\nDraft reply:\n${draft}`);
+
+      alerted.add(msg.pk);
+    }
+
+    saveAlertedMessages(alerted);
+  } catch(e) {
+    console.error('Unanswered message checker error:', e.message);
+  }
+}
+
+function startUnansweredChecker() {
+  setInterval(checkUnansweredClientMessages, 5 * 60 * 1000);
+  console.log('Unanswered client message checker running every 5 mins');
+}
+
 // ─── DEADLINE CHECKER (every 30 mins) ────────────────────────────────────────
 function startDeadlineChecker() {
   setInterval(async () => {
@@ -1970,6 +2089,7 @@ app.listen(PORT, async () => {
   scheduleDaily(() => 9, () => 0, async () => { const overdue = getClientsNeedingCheckin(); if (overdue.length > 0) await sendCheckinPrompts(); }, 'Daily Check-in Checker');
 
   startDeadlineChecker();
+  startUnansweredChecker();
 
   console.log('\nChief of Staff v4 ready!');
   console.log('NEW: wins | log win: Client, package, $value');
