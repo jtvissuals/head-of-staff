@@ -694,6 +694,147 @@ function getNurtureLeads() {
   }).join('\n');
 }
 
+// ─── MONDAY.COM ───────────────────────────────────────────────────────────────
+const MONDAY_BOARD_NAMES = {
+  jackson: 'Jackson Tasks',
+  anthony: 'Anthony (Editor)',
+  alik:    'Alik (Editor)',
+  tina:    'Tina (PA)',
+  projects: 'Projects P&L',
+  expenses: 'Expenses Ledger',
+};
+
+function mondayQuery(query, variables = {}) {
+  return axios.post('https://api.monday.com/v2',
+    { query, variables },
+    { headers: { 'Authorization': CONFIG.monday?.apiKey || '', 'Content-Type': 'application/json', 'API-Version': '2024-01' } }
+  );
+}
+
+async function getMondayTasks(boardKey) {
+  try {
+    const boards = CONFIG.monday?.boards || {};
+    const boardId = boards[boardKey] || boards.jackson;
+    const res = await mondayQuery(`{
+      boards(ids: [${boardId}]) {
+        name
+        items_page(limit: 50) {
+          items {
+            id name state
+            column_values { id text }
+          }
+        }
+      }
+    }`);
+    const board = res.data?.data?.boards?.[0];
+    if (!board) return `No board found for ${boardKey}.`;
+    const items = board.items_page.items.filter(i => i.state === 'active');
+    if (!items.length) return `No active tasks on ${board.name}.`;
+    const lines = items.map(item => {
+      const status = item.column_values.find(c => c.id === 'status')?.text || '';
+      const priority = item.column_values.find(c => c.id === 'color_mky8z6q8' || c.id === 'color_mky8z6q8')?.text || '';
+      const date = item.column_values.find(c => c.id === 'date4' || c.id === 'date_mky81jvr')?.text || '';
+      const parts = [item.name];
+      if (status) parts.push(`[${status}]`);
+      if (priority) parts.push(`(${priority})`);
+      if (date) parts.push(`due ${date}`);
+      return `• ${parts.join(' ')}`;
+    });
+    return `*${board.name}* — ${items.length} tasks:\n\n${lines.join('\n')}`;
+  } catch (e) { return `Monday.com error: ${e.message}`; }
+}
+
+async function getAllMondayTasks() {
+  try {
+    const boards = CONFIG.monday?.boards || {};
+    const ids = [boards.jackson, boards.anthony, boards.alik, boards.tina].filter(Boolean);
+    const res = await mondayQuery(`{
+      boards(ids: [${ids.join(',')}]) {
+        id name
+        items_page(limit: 50) {
+          items { id name state column_values { id text } }
+        }
+      }
+    }`);
+    const allBoards = res.data?.data?.boards || [];
+    let out = [];
+    for (const board of allBoards) {
+      const active = board.items_page.items.filter(i => i.state === 'active');
+      if (!active.length) continue;
+      const lines = active.map(item => {
+        const status = item.column_values.find(c => c.id === 'status')?.text || '';
+        const priority = item.column_values.find(c => c.id === 'color_mky8z6q8')?.text || '';
+        const date = item.column_values.find(c => c.id === 'date4' || c.id === 'date_mky81jvr')?.text || '';
+        const parts = [item.name];
+        if (status && status !== 'Not Started') parts.push(`[${status}]`);
+        if (priority) parts.push(`(${priority})`);
+        if (date) parts.push(`due ${date}`);
+        return `  • ${parts.join(' ')}`;
+      });
+      out.push(`*${board.name}* (${active.length}):\n${lines.join('\n')}`);
+    }
+    return out.length ? out.join('\n\n') : 'No active tasks across boards.';
+  } catch (e) { return `Monday.com error: ${e.message}`; }
+}
+
+async function createMondayTask(boardKey, taskName, statusText = '', priorityText = '', dueDate = '') {
+  try {
+    const boards = CONFIG.monday?.boards || {};
+    const boardId = boards[boardKey] || boards.jackson;
+    // First create the item
+    const createRes = await mondayQuery(
+      `mutation ($boardId: ID!, $itemName: String!) { create_item(board_id: $boardId, item_name: $itemName) { id } }`,
+      { boardId: String(boardId), itemName: taskName }
+    );
+    const itemId = createRes.data?.data?.create_item?.id;
+    if (!itemId) return `Failed to create task on Monday.com`;
+    // Update column values if provided
+    const colVals = {};
+    if (statusText) colVals['status'] = { label: statusText };
+    if (dueDate) {
+      // Try both date column IDs
+      colVals['date4'] = { date: dueDate };
+      colVals['date_mky81jvr'] = { date: dueDate };
+    }
+    if (Object.keys(colVals).length) {
+      await mondayQuery(
+        `mutation ($boardId: ID!, $itemId: ID!, $vals: JSON!) { change_multiple_column_values(board_id: $boardId, item_id: $itemId, column_values: $vals) { id } }`,
+        { boardId: String(boardId), itemId: String(itemId), vals: JSON.stringify(colVals) }
+      );
+    }
+    return `✅ Task created on ${MONDAY_BOARD_NAMES[boardKey] || boardKey}: "${taskName}"${dueDate ? ` due ${dueDate}` : ''}`;
+  } catch (e) { return `Monday.com error: ${e.message}`; }
+}
+
+async function updateMondayTaskStatus(itemId, statusLabel) {
+  try {
+    const res = await mondayQuery(
+      `mutation ($itemId: ID!, $boardId: ID!, $val: JSON!) { change_column_value(item_id: $itemId, board_id: $boardId, column_id: "status", value: $val) { id } }`,
+      { itemId: String(itemId), boardId: '5025841409', val: JSON.stringify({ label: statusLabel }) }
+    );
+    if (res.data?.data?.change_column_value?.id) return `✅ Status updated to "${statusLabel}"`;
+    return `Update may have failed — check Monday.com`;
+  } catch (e) { return `Monday.com error: ${e.message}`; }
+}
+
+async function searchMondayTask(boardKey, searchTerm) {
+  try {
+    const boards = CONFIG.monday?.boards || {};
+    const boardId = boards[boardKey] || boards.jackson;
+    const res = await mondayQuery(`{
+      boards(ids: [${boardId}]) {
+        items_page(limit: 100) {
+          items { id name state column_values { id text } }
+        }
+      }
+    }`);
+    const items = res.data?.data?.boards?.[0]?.items_page?.items || [];
+    const matches = items.filter(i => i.state === 'active' && i.name.toLowerCase().includes(searchTerm.toLowerCase()));
+    if (!matches.length) return `No tasks matching "${searchTerm}" found.`;
+    return matches.map(i => `• [ID: ${i.id}] ${i.name}`).join('\n');
+  } catch (e) { return `Monday.com error: ${e.message}`; }
+}
+
 // ─── FIREFLIES ────────────────────────────────────────────────────────────────
 function firefliesQuery(query, variables = {}) {
   return axios.post('https://api.fireflies.ai/graphql',
@@ -1353,6 +1494,18 @@ const TOOLS = [
     input_schema: { type: 'object', required: ['name'], properties: { name: { type: 'string' }, contact: { type: 'string' }, niche: { type: 'string' }, budget: { type: 'string' }, source: { type: 'string' }, notes: { type: 'string' } } }
   },
   { name: 'get_nurture_leads',       description: 'Get all active leads in the nurture sequence', input_schema: { type: 'object', properties: {}, required: [] } },
+  { name: 'get_monday_tasks',        description: 'Get tasks from Monday.com boards — Jackson, Anthony, Alik, or Tina',
+    input_schema: { type: 'object', properties: { board: { type: 'string', description: '"jackson", "anthony", "alik", "tina", "all", "projects", "expenses"' } }, required: [] }
+  },
+  { name: 'create_monday_task',      description: 'Create a new task on a Monday.com board',
+    input_schema: { type: 'object', required: ['task_name'], properties: { board: { type: 'string', description: '"jackson", "anthony", "alik", "tina" — default jackson' }, task_name: { type: 'string' }, status: { type: 'string', description: 'e.g. "Working on it", "Done", "Not Started"' }, due_date: { type: 'string', description: 'YYYY-MM-DD' } } }
+  },
+  { name: 'update_monday_status',    description: 'Update the status of a Monday.com task by item ID',
+    input_schema: { type: 'object', required: ['item_id','status'], properties: { item_id: { type: 'string' }, status: { type: 'string', description: '"Done", "Working on it", "Stuck", "Not Started"' }, board: { type: 'string' } } }
+  },
+  { name: 'search_monday_task',      description: 'Search for a task by name on a Monday.com board to get its ID',
+    input_schema: { type: 'object', required: ['search'], properties: { search: { type: 'string' }, board: { type: 'string', description: 'default jackson' } } }
+  },
   { name: 'analyse_calls',           description: 'Analyse recent Fireflies sales calls for patterns, objections, and what closes deals', input_schema: { type: 'object', properties: {}, required: [] } },
   { name: 'get_response_times',      description: 'Get WhatsApp response time report for all active clients', input_schema: { type: 'object', properties: {}, required: [] } },
   { name: 'get_group_tasks',         description: 'Get open action items detected from client WhatsApp groups', input_schema: { type: 'object', properties: {}, required: [] } },
@@ -1449,6 +1602,10 @@ async function executeTool(name, input) {
     }
     case 'add_nurture_lead':          return addNurtureLead(input.name, input.contact||'', input.niche||'', input.budget||'', input.source||'', input.notes||'');
     case 'get_nurture_leads':         return getNurtureLeads();
+    case 'get_monday_tasks':          return input.board === 'all' ? await getAllMondayTasks() : await getMondayTasks(input.board || 'jackson');
+    case 'create_monday_task':        return await createMondayTask(input.board || 'jackson', input.task_name, input.status || '', '', input.due_date || '');
+    case 'update_monday_status':      return await updateMondayTaskStatus(input.item_id, input.status);
+    case 'search_monday_task':        return await searchMondayTask(input.board || 'jackson', input.search);
     case 'analyse_calls':             return await analysePastCalls();
     case 'get_response_times':        return getResponseTimeReport();
     case 'get_group_tasks':           return await getOpenGroupTasks();
