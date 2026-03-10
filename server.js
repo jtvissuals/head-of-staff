@@ -1156,6 +1156,9 @@ async function doMarketResearch() {
 const TOOLS = [
   { name: 'get_mrr',                 description: 'Get current MRR breakdown across all active clients', input_schema: { type: 'object', properties: {}, required: [] } },
   { name: 'analyse_calls',           description: 'Analyse recent Fireflies sales calls for patterns, objections, and what closes deals', input_schema: { type: 'object', properties: {}, required: [] } },
+  { name: 'get_response_times',      description: 'Get WhatsApp response time report for all active clients', input_schema: { type: 'object', properties: {}, required: [] } },
+  { name: 'get_group_tasks',         description: 'Get open action items detected from client WhatsApp groups', input_schema: { type: 'object', properties: {}, required: [] } },
+  { name: 'scan_group_tasks',        description: 'Rescan all client WhatsApp groups for new action items right now', input_schema: { type: 'object', properties: {}, required: [] } },
   { name: 'get_calendar',            description: "Get today's calendar events", input_schema: { type: 'object', properties: {}, required: [] } },
   { name: 'get_yesterday_events',    description: "Get yesterday's calendar events", input_schema: { type: 'object', properties: {}, required: [] } },
   { name: 'schedule_appointment',    description: 'Schedule a call or appointment — books in GHL CRM and Google Calendar simultaneously. Use this for any "schedule a call", "book a meeting", "set up a time" request.',
@@ -1239,6 +1242,9 @@ async function executeTool(name, input) {
   switch (name) {
     case 'get_mrr':                   return getMRR();
     case 'analyse_calls':             return await analysePastCalls();
+    case 'get_response_times':        return getResponseTimeReport();
+    case 'get_group_tasks':           return await getOpenGroupTasks();
+    case 'scan_group_tasks':          await checkClientGroupTasks(); return 'Scan complete.';
     case 'get_calendar':              return await getCalendarEvents();
     case 'get_yesterday_events':      return await getYesterdayEvents();
     case 'schedule_appointment': {
@@ -1594,6 +1600,288 @@ Rules: Sound exactly like Jackson. Casual Australian tone. Under 2 sentences. No
 function startUnansweredChecker() {
   setInterval(checkUnansweredClientMessages, 5 * 60 * 1000);
   console.log('Unanswered client message checker running every 5 mins');
+}
+
+// ─── EMAIL CHECKER (every 5 mins) ────────────────────────────────────────────
+const ALERTED_EMAILS_PATH = path.join(__dirname, 'alerted-emails.json');
+
+function loadAlertedEmails() {
+  if (fs.existsSync(ALERTED_EMAILS_PATH)) {
+    try { return new Set(JSON.parse(fs.readFileSync(ALERTED_EMAILS_PATH))); } catch(e) {}
+  }
+  return new Set();
+}
+
+function saveAlertedEmails(set) {
+  fs.writeFileSync(ALERTED_EMAILS_PATH, JSON.stringify([...set].slice(-500)));
+}
+
+async function checkUnansweredEmails() {
+  try {
+    const auth = getGoogleAuth();
+    if (!auth) return;
+    const gmail = google.gmail({ version: 'v1', auth });
+
+    // Get emails older than 1 hour that are still unread
+    const oneHourAgo = Math.floor((Date.now() - 3600000) / 1000);
+    const res = await gmail.users.messages.list({
+      userId: 'me',
+      q: `is:unread is:inbox before:${oneHourAgo}`,
+      maxResults: 10
+    });
+
+    const messages = res.data.messages || [];
+    if (!messages.length) return;
+
+    const alerted = loadAlertedEmails();
+    const newMessages = messages.filter(m => !alerted.has(m.id));
+    if (!newMessages.length) return;
+
+    const emailStyle = getEmailStyle();
+
+    for (const m of newMessages.slice(0, 3)) {
+      try {
+        const msg = await gmail.users.messages.get({ userId: 'me', id: m.id, format: 'full' });
+        const h = msg.data.payload.headers;
+        const from = h.find(x => x.name === 'From')?.value || 'Unknown';
+        const subject = h.find(x => x.name === 'Subject')?.value || '(no subject)';
+        const date = h.find(x => x.name === 'Date')?.value || '';
+
+        let body = '';
+        const parts = msg.data.payload.parts || [msg.data.payload];
+        for (const part of parts) {
+          if (part.mimeType === 'text/plain' && part.body?.data) {
+            body = Buffer.from(part.body.data, 'base64').toString('utf8').substring(0, 600);
+            break;
+          }
+        }
+        if (!body) body = msg.data.snippet || '';
+
+        const hoursAgo = Math.round((Date.now() - new Date(date).getTime()) / 3600000 * 10) / 10;
+
+        const draft = await draftEmailReply(from, subject, body);
+        const fromName = from.split('<')[0].trim().replace(/"/g, '');
+        await sendToJackson(`Email (${hoursAgo}h ago) from ${fromName}:\nSubject: ${subject}\n\nDraft reply:\n${draft}`);
+
+        alerted.add(m.id);
+      } catch(e) { console.error('Email checker item error:', e.message); }
+    }
+
+    saveAlertedEmails(alerted);
+  } catch(e) {
+    console.error('Email checker error:', e.message);
+  }
+}
+
+function startEmailChecker() {
+  setInterval(checkUnansweredEmails, 5 * 60 * 1000);
+  console.log('Unanswered email checker running every 5 mins');
+}
+
+// ─── RESPONSE TIME REPORT ─────────────────────────────────────────────────────
+function getResponseTimeReport() {
+  const clientNames = JT_BUSINESS_CLIENTS.map(c => c.name);
+  const twoDaysAgoCoreData = (Date.now() / 1000 - 172800) - 978307200;
+  const results = [];
+
+  for (const client of clientNames) {
+    const firstName = client.split(' ')[0];
+    // Get all messages in this client's chat from last 48h, ordered by time
+    const sql = `SELECT m.ZISFROMME, m.ZMESSAGEDATE FROM ZWAMESSAGE m
+      LEFT JOIN ZWACHATSESSION s ON m.ZCHATSESSION = s.Z_PK
+      WHERE (s.ZPARTNERNAME LIKE '%${firstName}%')
+      AND m.ZTEXT IS NOT NULL AND m.ZTEXT != ''
+      AND m.ZMESSAGEDATE > ${twoDaysAgoCoreData}
+      ORDER BY m.ZMESSAGEDATE ASC;`;
+
+    const raw = queryWhatsApp(sql);
+    if (!raw) continue;
+
+    const msgs = raw.split('\n').map(line => {
+      const parts = line.split('|');
+      return { fromMe: parts[0]?.trim() === '1', ts: parseFloat(parts[1]) };
+    }).filter(m => !isNaN(m.ts));
+
+    if (msgs.length < 2) continue;
+
+    // Find response times: time between their message and Jackson's next reply
+    const responseTimes = [];
+    for (let i = 0; i < msgs.length - 1; i++) {
+      if (!msgs[i].fromMe) {
+        // Find next message from Jackson
+        for (let j = i + 1; j < msgs.length; j++) {
+          if (msgs[j].fromMe) {
+            const mins = Math.round((msgs[j].ts - msgs[i].ts) / 60);
+            if (mins > 0 && mins < 1440) responseTimes.push(mins); // ignore >24hr gaps
+            break;
+          }
+        }
+      }
+    }
+
+    if (responseTimes.length) {
+      const avg = Math.round(responseTimes.reduce((a, b) => a + b, 0) / responseTimes.length);
+      const avgStr = avg < 60 ? `${avg}m` : `${Math.round(avg / 60 * 10) / 10}h`;
+      results.push({ name: client, avg, avgStr, count: responseTimes.length });
+    }
+  }
+
+  if (!results.length) return 'No response data in the last 48h Boss.';
+
+  results.sort((a, b) => b.avg - a.avg);
+  const overallAvg = Math.round(results.reduce((s, r) => s + r.avg, 0) / results.length);
+  const overallStr = overallAvg < 60 ? `${overallAvg}m` : `${Math.round(overallAvg / 60 * 10) / 10}h`;
+
+  const lines = results.map(r => {
+    const flag = r.avg > 120 ? ' ⚠️' : r.avg > 60 ? ' 🟡' : ' ✅';
+    return `${r.name}: ${r.avgStr}${flag}`;
+  });
+
+  return `Response times (last 48h) Boss\nAverage: ${overallStr}\n\n${lines.join('\n')}`;
+}
+
+async function sendDailyResponseReport() {
+  try {
+    const report = getResponseTimeReport();
+    await sendToJackson(report);
+  } catch(e) { console.error('Response report error:', e.message); }
+}
+
+// ─── CLIENT GROUP TASK SCANNER ───────────────────────────────────────────────
+const CLIENT_GROUPS = [
+  // Client groups
+  { name: 'Alpha Physiques', jid: '120363404692586938@g.us' },
+  { name: 'Hattie (Flex Method)', jid: '120363406476336157@g.us' },
+  { name: 'Jese Smith', jid: '120363422043939750@g.us' },
+  { name: 'CoreCoach', jid: '120363423161635535@g.us' },
+  { name: 'Kingbodies', jid: '120363402284858924@g.us' },
+  { name: 'Pantry Girl', jid: '120363407843193014@g.us' },
+  { name: 'Raw Reality', jid: '120363407442656440@g.us' },
+  { name: 'Jess Richards', jid: '120363423326751113@g.us' },
+  { name: 'Morgan', jid: '120363423867050524@g.us' },
+  { name: 'Harry Drew', jid: '120363426032270324@g.us' },
+  { name: 'NLP', jid: '120363402438874395@g.us' },
+  // Team group
+  { name: 'JT Team', jid: '120363420205328440@g.us' },
+  // Staff (individual chats)
+  { name: 'Tina (PA)', jid: '61414340284@s.whatsapp.net' },
+  { name: 'Anthony Legeay', jid: '33625953533@s.whatsapp.net' },
+  { name: 'Anik', jid: '191547018604728@lid' },
+];
+
+const GROUP_TASKS_PATH = path.join(__dirname, 'group-tasks.json');
+
+function loadGroupTasks() {
+  if (fs.existsSync(GROUP_TASKS_PATH)) {
+    try { return JSON.parse(fs.readFileSync(GROUP_TASKS_PATH)); } catch(e) {}
+  }
+  return {};
+}
+
+function saveGroupTasks(tasks) {
+  fs.writeFileSync(GROUP_TASKS_PATH, JSON.stringify(tasks, null, 2));
+}
+
+function getGroupMessages(jid, hours = 48) {
+  const cutoff = (Date.now() / 1000 - hours * 3600) - 978307200;
+  const sql = `SELECT m.ZISFROMME, COALESCE(m.ZPUSHNAME, 'Unknown') as sender, m.ZTEXT, m.ZMESSAGEDATE
+    FROM ZWAMESSAGE m
+    LEFT JOIN ZWACHATSESSION s ON m.ZCHATSESSION = s.Z_PK
+    WHERE s.ZCONTACTJID = '${jid}'
+    AND m.ZTEXT IS NOT NULL AND m.ZTEXT != ''
+    AND m.ZMESSAGEDATE > ${cutoff}
+    ORDER BY m.ZMESSAGEDATE ASC;`;
+  const raw = queryWhatsApp(sql);
+  if (!raw) return [];
+  return raw.split('\n').map(line => {
+    const parts = line.split('|');
+    return {
+      fromMe: parts[0]?.trim() === '1',
+      sender: parts[1]?.trim(),
+      text: parts[2]?.trim(),
+      ts: parseFloat(parts[3])
+    };
+  }).filter(m => m.text && !isNaN(m.ts));
+}
+
+async function scanGroupForTasks(group) {
+  const messages = getGroupMessages(group.jid, 48);
+  if (messages.length < 2) return [];
+
+  const transcript = messages.map(m =>
+    `[${m.fromMe ? 'Jackson' : m.sender}]: ${m.text}`
+  ).join('\n');
+
+  const prompt = `Analyse this WhatsApp group conversation between Jackson Edwards (JT Visuals) and client ${group.name}.
+
+CONVERSATION (last 48h):
+${transcript.substring(0, 3000)}
+
+Identify ONLY concrete action items that Jackson needs to do — things that were requested, agreed to, or are clearly expected of him.
+Ignore general chat, compliments, questions already answered, or things Jackson already confirmed doing.
+
+Return a JSON array like:
+[{"task": "Send edited reels by Friday", "urgency": "high|medium|low", "from": "who asked"}]
+
+If there are no action items for Jackson, return [].
+Return ONLY the JSON array, nothing else.`;
+
+  try {
+    const r = await axios.post('https://api.anthropic.com/v1/messages',
+      { model: MODEL_LOW, max_tokens: 400, messages: [{ role: 'user', content: prompt }] },
+      { headers: { 'x-api-key': CONFIG.claude.apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' } });
+    const text = r.data.content[0].text.trim();
+    const match = text.match(/\[[\s\S]*\]/);
+    if (!match) return [];
+    return JSON.parse(match[0]).map(t => ({ ...t, group: group.name, detectedAt: new Date().toISOString() }));
+  } catch(e) { return []; }
+}
+
+async function checkClientGroupTasks() {
+  try {
+    const allTasks = loadGroupTasks();
+    const newTasks = [];
+
+    for (const group of CLIENT_GROUPS) {
+      const tasks = await scanGroupForTasks(group);
+      for (const task of tasks) {
+        // Deduplicate by task text similarity
+        const key = `${group.name}:${task.task.substring(0, 50).toLowerCase().replace(/\s+/g, ' ')}`;
+        if (!allTasks[key]) {
+          allTasks[key] = { ...task, alertedAt: new Date().toISOString(), done: false };
+          newTasks.push(task);
+        }
+      }
+    }
+
+    saveGroupTasks(allTasks);
+
+    if (newTasks.length) {
+      const urgent = newTasks.filter(t => t.urgency === 'high');
+      const rest = newTasks.filter(t => t.urgency !== 'high');
+      let msg = `Tasks from client groups Boss:\n\n`;
+      if (urgent.length) msg += urgent.map(t => `🔴 ${t.group}: ${t.task}`).join('\n') + '\n\n';
+      if (rest.length) msg += rest.map(t => `• ${t.group}: ${t.task}`).join('\n');
+      await sendToJackson(msg.trim());
+    }
+  } catch(e) { console.error('Group task scanner error:', e.message); }
+}
+
+async function getOpenGroupTasks() {
+  const allTasks = loadGroupTasks();
+  const open = Object.values(allTasks).filter(t => !t.done);
+  if (!open.open) {
+    // Re-scan if no tasks found
+    await checkClientGroupTasks();
+    return;
+  }
+  if (!open.length) return 'No open tasks from client groups Boss.';
+  const urgent = open.filter(t => t.urgency === 'high');
+  const rest = open.filter(t => t.urgency !== 'high');
+  let msg = 'Open tasks from client groups Boss:\n\n';
+  if (urgent.length) msg += urgent.map(t => `🔴 ${t.group}: ${t.task}`).join('\n') + '\n\n';
+  if (rest.length) msg += rest.map(t => `• ${t.group}: ${t.task}`).join('\n');
+  return msg.trim();
 }
 
 // ─── DEADLINE CHECKER (every 30 mins) ────────────────────────────────────────
@@ -2090,6 +2378,12 @@ app.listen(PORT, async () => {
 
   startDeadlineChecker();
   startUnansweredChecker();
+  startEmailChecker();
+  scheduleDaily(() => 17, () => 0, sendDailyResponseReport, 'Daily Response Time Report');
+  scheduleDaily(() => 8, () => 0, checkClientGroupTasks, 'Morning Group Task Scan');
+  scheduleDaily(() => 13, () => 0, checkClientGroupTasks, 'Afternoon Group Task Scan');
+  scheduleDaily(() => 17, () => 0, checkClientGroupTasks, 'Evening Group Task Scan');
+  scheduleDaily(() => 21, () => 0, checkClientGroupTasks, 'Night Group Task Scan');
 
   console.log('\nChief of Staff v4 ready!');
   console.log('NEW: wins | log win: Client, package, $value');
