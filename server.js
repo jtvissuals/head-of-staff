@@ -694,172 +694,190 @@ function getNurtureLeads() {
   }).join('\n');
 }
 
-// ─── ANALYTICS DASHBOARD ──────────────────────────────────────────────────────
+// ─── ANALYTICS DASHBOARD (METRICOOL) ──────────────────────────────────────────
+function metricoolParams(extra = {}) {
+  const mc = CONFIG.metricool || {};
+  return { userId: mc.userId, blogId: mc.blogId, ...extra };
+}
+function metricoolHeaders() {
+  return { 'X-Mc-Auth': CONFIG.metricool?.userToken || '', 'Content-Type': 'application/json' };
+}
+function metricoolDates(days) {
+  const end = new Date();
+  const start = new Date(Date.now() - days * 86400000);
+  const fmt = d => d.toISOString().slice(0,10).replace(/-/g,'');
+  return { start: fmt(start), end: fmt(end) };
+}
+
 async function getInstagramAnalytics(days = 7) {
   try {
-    const igCfg = CONFIG.instagram;
-    if (!igCfg?.accessToken || !igCfg?.userId) return '❌ Instagram not connected — ask Jackson to run "connect instagram"';
-    const token = igCfg.accessToken;
-    const userId = igCfg.userId;
+    const mc = CONFIG.metricool;
+    if (!mc?.userToken) return '❌ Metricool not connected — send me your Metricool userToken, userId, and blogId';
+    const { start, end } = metricoolDates(days);
+    const base = 'https://app.metricool.com/api';
+    const params = metricoolParams({ start, end });
+    const headers = metricoolHeaders();
 
-    // Account basics
-    const profileRes = await axios.get(`https://graph.facebook.com/v21.0/${userId}`, {
-      params: { fields: 'followers_count,media_count,name,username,biography', access_token: token }
-    });
-    const profile = profileRes.data;
+    // Fetch metrics in parallel
+    const [followersRes, reachRes, impressionsRes, profileViewsRes, engagementRes, postsRes, reelsRes] = await Promise.allSettled([
+      axios.get(`${base}/stats/timeline/igFollowers`,      { params, headers }),
+      axios.get(`${base}/stats/timeline/igreach`,          { params, headers }),
+      axios.get(`${base}/stats/timeline/igimpressions`,    { params, headers }),
+      axios.get(`${base}/stats/timeline/igprofile_views`,  { params, headers }),
+      axios.get(`${base}/stats/timeline/igEngagement`,     { params, headers }),
+      axios.get(`${base}/stats/instagram/posts`,           { params: metricoolParams({ start, end, sortBy: 'reach', sortOrder: 'desc', limit: 5 }), headers }),
+      axios.get(`${base}/stats/instagram/reels`,           { params: metricoolParams({ start, end, sortBy: 'reach', sortOrder: 'desc', limit: 5 }), headers }),
+    ]);
 
-    // Account insights
-    const insightRes = await axios.get(`https://graph.facebook.com/v21.0/${userId}/insights`, {
-      params: {
-        metric: 'reach,impressions,profile_views,follower_count',
-        period: 'day',
-        since: Math.floor((Date.now() - days * 86400000) / 1000),
-        until: Math.floor(Date.now() / 1000),
-        access_token: token
-      }
-    });
-    const insights = {};
-    for (const metric of (insightRes.data?.data || [])) {
-      const total = metric.values.reduce((s, v) => s + (v.value || 0), 0);
-      insights[metric.name] = total;
-    }
+    const lastVal = (res) => {
+      if (res.status !== 'fulfilled') return 0;
+      const d = res.value.data;
+      if (Array.isArray(d) && d.length) return d[d.length - 1][1] || 0;
+      return 0;
+    };
+    const sumVal = (res) => {
+      if (res.status !== 'fulfilled') return 0;
+      const d = res.value.data;
+      if (Array.isArray(d)) return d.reduce((s, row) => s + (parseFloat(row[1]) || 0), 0);
+      return 0;
+    };
 
-    // Recent media performance
-    const mediaRes = await axios.get(`https://graph.facebook.com/v21.0/${userId}/media`, {
-      params: {
-        fields: 'id,caption,media_type,timestamp,like_count,comments_count,insights.metric(reach,impressions,plays)',
-        limit: 10,
-        access_token: token
-      }
-    });
-    const posts = mediaRes.data?.data || [];
-    const topPosts = posts
-      .map(p => ({
-        caption: (p.caption || '').substring(0, 60).replace(/\n/g, ' '),
-        likes: p.like_count || 0,
-        comments: p.comments_count || 0,
-        reach: p.insights?.data?.find(i => i.name === 'reach')?.values?.[0]?.value || 0,
-        plays: p.insights?.data?.find(i => i.name === 'plays')?.values?.[0]?.value || 0,
-        type: p.media_type,
-        date: new Date(p.timestamp).toLocaleDateString('en-AU', { day: 'numeric', month: 'short' })
-      }))
-      .sort((a, b) => b.reach - a.reach);
+    const followers = lastVal(followersRes);
+    const reach = Math.round(sumVal(reachRes));
+    const impressions = Math.round(sumVal(impressionsRes));
+    const profileViews = Math.round(sumVal(profileViewsRes));
+    const engagement = (sumVal(engagementRes) / days).toFixed(2);
 
     let out = `📊 *Instagram Analytics — Last ${days} Days*\n\n`;
-    out += `👤 @${profile.username} | ${profile.followers_count?.toLocaleString()} followers\n`;
-    out += `📸 ${profile.media_count} total posts\n\n`;
-    out += `*Performance:*\n`;
-    out += `• Reach: ${(insights.reach || 0).toLocaleString()}\n`;
-    out += `• Impressions: ${(insights.impressions || 0).toLocaleString()}\n`;
-    out += `• Profile views: ${(insights.profile_views || 0).toLocaleString()}\n\n`;
+    out += `👥 Followers: ${followers.toLocaleString()}\n`;
+    out += `👁️ Reach: ${reach.toLocaleString()}\n`;
+    out += `📣 Impressions: ${impressions.toLocaleString()}\n`;
+    out += `🔍 Profile Views: ${profileViews.toLocaleString()}\n`;
+    out += `💥 Avg Engagement/day: ${engagement}%\n`;
 
-    if (topPosts.length) {
-      out += `*Top posts this period:*\n`;
-      topPosts.slice(0, 3).forEach((p, i) => {
-        out += `${i + 1}. ${p.type === 'VIDEO' ? '🎬' : '📸'} ${p.caption || '(no caption)'}...\n`;
-        out += `   ❤️ ${p.likes} | 💬 ${p.comments} | 👁️ ${p.reach.toLocaleString()} reach${p.plays ? ` | ▶️ ${p.plays.toLocaleString()} plays` : ''} (${p.date})\n`;
+    // Top posts
+    const posts = postsRes.status === 'fulfilled' ? (postsRes.value.data?.data || postsRes.value.data || []) : [];
+    const reels = reelsRes.status === 'fulfilled' ? (reelsRes.value.data?.data || reelsRes.value.data || []) : [];
+    const allContent = [...posts, ...reels]
+      .sort((a, b) => (b.reach || 0) - (a.reach || 0))
+      .slice(0, 3);
+
+    if (allContent.length) {
+      out += `\n*Top content this period:*\n`;
+      allContent.forEach((p, i) => {
+        const caption = (p.text || p.caption || '').substring(0, 55).replace(/\n/g, ' ');
+        const type = p.type === 'REEL' || p.reel ? '🎬' : '📸';
+        out += `${i + 1}. ${type} ${caption || '(no caption)'}...\n`;
+        out += `   ❤️ ${p.likes || 0} | 💬 ${p.comments || 0} | 👁️ ${(p.reach || 0).toLocaleString()} reach\n`;
       });
     }
     return out;
   } catch (e) {
-    if (e.response?.data?.error) return `Instagram API error: ${e.response.data.error.message}`;
-    return `Instagram error: ${e.message}`;
+    if (e.response?.status === 401) return '❌ Metricool token invalid — re-send your userToken';
+    return `Instagram analytics error: ${e.message}`;
   }
 }
 
-async function getTikTokAnalytics() {
+async function getTikTokAnalytics(days = 7) {
   try {
-    const ttCfg = CONFIG.tiktok;
-    if (!ttCfg?.accessToken) return '❌ TikTok not connected — ask Jackson to run "connect tiktok"';
+    const mc = CONFIG.metricool;
+    if (!mc?.userToken) return '❌ Metricool not connected';
+    const { start, end } = metricoolDates(days);
+    const base = 'https://app.metricool.com/api';
+    const params = metricoolParams({ start, end });
+    const headers = metricoolHeaders();
 
-    // TikTok Business API v2
-    const userRes = await axios.get('https://business-api.tiktok.com/open_api/v1.3/bc/user/info/', {
-      headers: { 'Access-Token': ttCfg.accessToken }
-    });
+    const [followersRes, viewsRes, likesRes] = await Promise.allSettled([
+      axios.get(`${base}/stats/timeline/tkFollowers`,   { params, headers }),
+      axios.get(`${base}/stats/timeline/tkVideoViews`,  { params, headers }),
+      axios.get(`${base}/stats/timeline/tkLikes`,       { params, headers }),
+    ]);
 
-    // Video list for engagement stats
-    const videoRes = await axios.post('https://business-api.tiktok.com/open_api/v1.3/research/video/query/', {
-      filters: {
-        video_ids: []
-      },
-      fields: ['video_id', 'create_time', 'like_count', 'comment_count', 'share_count', 'view_count']
-    }, {
-      headers: { 'Access-Token': ttCfg.accessToken, 'Content-Type': 'application/json' }
-    });
+    const lastVal = (res) => {
+      if (res.status !== 'fulfilled') return 0;
+      const d = res.value.data;
+      if (Array.isArray(d) && d.length) return d[d.length - 1][1] || 0;
+      return 0;
+    };
+    const sumVal = (res) => {
+      if (res.status !== 'fulfilled') return 0;
+      const d = res.value.data;
+      if (Array.isArray(d)) return d.reduce((s, row) => s + (parseFloat(row[1]) || 0), 0);
+      return 0;
+    };
 
-    const user = userRes.data?.data;
-    let out = `📱 *TikTok Analytics*\n\n`;
-    if (user) {
-      out += `👤 @${user.username || 'unknown'} | ${(user.follower_count || 0).toLocaleString()} followers\n`;
-      out += `❤️ ${(user.likes_count || 0).toLocaleString()} total likes\n`;
-    }
+    const followers = lastVal(followersRes);
+    const views = Math.round(sumVal(viewsRes));
+    const likes = Math.round(sumVal(likesRes));
+
+    if (!followers && !views && !likes) return '📱 *TikTok* — No data yet. Make sure TikTok is connected in Metricool.';
+
+    let out = `📱 *TikTok Analytics — Last ${days} Days*\n\n`;
+    out += `👥 Followers: ${followers.toLocaleString()}\n`;
+    out += `▶️ Video Views: ${views.toLocaleString()}\n`;
+    out += `❤️ Likes: ${likes.toLocaleString()}\n`;
     return out;
-  } catch (e) {
-    if (e.response?.status === 401) return '❌ TikTok token expired — run "connect tiktok" to re-auth';
-    return `TikTok error: ${e.message}`;
-  }
+  } catch (e) { return `TikTok analytics error: ${e.message}`; }
+}
+
+async function getYouTubeAnalytics(days = 7) {
+  try {
+    const mc = CONFIG.metricool;
+    if (!mc?.userToken) return '❌ Metricool not connected';
+    const { start, end } = metricoolDates(days);
+    const base = 'https://app.metricool.com/api';
+    const params = metricoolParams({ start, end });
+    const headers = metricoolHeaders();
+
+    const [subsRes, viewsRes] = await Promise.allSettled([
+      axios.get(`${base}/stats/timeline/yttotalSubscribers`, { params, headers }),
+      axios.get(`${base}/stats/timeline/ytviews`,            { params, headers }),
+    ]);
+
+    const lastVal = (res) => {
+      if (res.status !== 'fulfilled') return 0;
+      const d = res.value.data;
+      if (Array.isArray(d) && d.length) return d[d.length - 1][1] || 0;
+      return 0;
+    };
+    const sumVal = (res) => {
+      if (res.status !== 'fulfilled') return 0;
+      const d = res.value.data;
+      if (Array.isArray(d)) return d.reduce((s, row) => s + (parseFloat(row[1]) || 0), 0);
+      return 0;
+    };
+
+    const subs = lastVal(subsRes);
+    const views = Math.round(sumVal(viewsRes));
+
+    if (!subs && !views) return null; // skip if no YouTube connected
+
+    let out = `🎥 *YouTube Analytics — Last ${days} Days*\n\n`;
+    out += `👥 Subscribers: ${subs.toLocaleString()}\n`;
+    out += `▶️ Views: ${views.toLocaleString()}\n`;
+    return out;
+  } catch (e) { return null; }
 }
 
 async function getFullAnalyticsDashboard(days = 7) {
-  const [igReport, ttReport] = await Promise.allSettled([
+  const [ig, tt, yt] = await Promise.allSettled([
     getInstagramAnalytics(days),
-    getTikTokAnalytics()
+    getTikTokAnalytics(days),
+    getYouTubeAnalytics(days),
   ]);
-  let out = '';
-  out += igReport.status === 'fulfilled' ? igReport.value : `Instagram: ${igReport.reason?.message}`;
-  out += '\n\n';
-  out += ttReport.status === 'fulfilled' ? ttReport.value : `TikTok: ${ttReport.reason?.message}`;
-  return out;
+  const parts = [];
+  if (ig.status === 'fulfilled' && ig.value) parts.push(ig.value);
+  if (tt.status === 'fulfilled' && tt.value) parts.push(tt.value);
+  if (yt.status === 'fulfilled' && yt.value) parts.push(yt.value);
+  return parts.join('\n\n─────────────────\n\n') || 'No analytics data available.';
 }
 
 async function sendWeeklyAnalyticsReport() {
   try {
     const report = await getFullAnalyticsDashboard(7);
-    await sendWhatsApp(`📊 *Weekly Analytics Report — ${new Date().toLocaleDateString('en-AU', { weekday: 'long', day: 'numeric', month: 'long' })}*\n\n${report}`);
+    const date = new Date().toLocaleDateString('en-AU', { timeZone: CONFIG.owner.timezone, weekday: 'long', day: 'numeric', month: 'long' });
+    await sendWhatsApp(`📊 *Weekly Analytics — ${date}*\n\n${report}`);
   } catch (e) { console.error('Weekly analytics report error:', e.message); }
-}
-
-async function connectInstagram(accessToken) {
-  try {
-    // Get user ID from token
-    const res = await axios.get('https://graph.facebook.com/v21.0/me/accounts', {
-      params: { access_token: accessToken, fields: 'id,name,instagram_business_account' }
-    });
-    const pages = res.data?.data || [];
-    const pageWithIg = pages.find(p => p.instagram_business_account);
-    if (!pageWithIg) return '❌ No Instagram Business Account found linked to this Facebook Page token. Make sure your Instagram is connected to a Facebook Page in Meta Business Suite.';
-
-    const igUserId = pageWithIg.instagram_business_account.id;
-    // Get a long-lived page token
-    const pageTokenRes = await axios.get(`https://graph.facebook.com/v21.0/${pageWithIg.id}`, {
-      params: { fields: 'access_token', access_token: accessToken }
-    });
-    const pageToken = pageTokenRes.data?.access_token || accessToken;
-
-    // Get long-lived token
-    const llRes = await axios.get('https://graph.facebook.com/v21.0/oauth/access_token', {
-      params: {
-        grant_type: 'fb_exchange_token',
-        client_id: CONFIG.instagram?.appId || '',
-        client_secret: CONFIG.instagram?.appSecret || '',
-        fb_exchange_token: pageToken
-      }
-    });
-    const longToken = llRes.data?.access_token || pageToken;
-
-    // Verify it works
-    const profileRes = await axios.get(`https://graph.facebook.com/v21.0/${igUserId}`, {
-      params: { fields: 'username,followers_count', access_token: longToken }
-    });
-    const profile = profileRes.data;
-
-    CONFIG.instagram = { ...CONFIG.instagram, userId: igUserId, accessToken: longToken };
-    fs.writeFileSync(path.join(__dirname, 'config.json'), JSON.stringify(CONFIG, null, 2));
-    return `✅ Instagram connected! @${profile.username} — ${profile.followers_count?.toLocaleString()} followers`;
-  } catch (e) {
-    if (e.response?.data?.error) return `❌ ${e.response.data.error.message}`;
-    return `❌ Error: ${e.message}`;
-  }
 }
 
 // ─── MONDAY.COM ───────────────────────────────────────────────────────────────
@@ -1749,8 +1767,8 @@ const TOOLS = [
   { name: 'get_analytics',           description: 'Get Instagram and TikTok analytics dashboard — follower count, reach, impressions, top posts',
     input_schema: { type: 'object', properties: { days: { type: 'number', description: 'Number of days to look back (default 7)' }, platform: { type: 'string', description: '"instagram", "tiktok", or "all" (default all)' } }, required: [] }
   },
-  { name: 'connect_instagram',       description: 'Connect Instagram Business account using a Meta access token',
-    input_schema: { type: 'object', required: ['access_token'], properties: { access_token: { type: 'string' } } }
+  { name: 'connect_metricool',       description: 'Save Metricool credentials (userToken, userId, blogId) to enable analytics',
+    input_schema: { type: 'object', required: ['user_token','user_id','blog_id'], properties: { user_token: { type: 'string' }, user_id: { type: 'string' }, blog_id: { type: 'string' } } }
   },
   { name: 'generate_caption',        description: 'Write an Instagram caption for a client',
     input_schema: { type: 'object', required: ['topic'], properties: { topic: { type: 'string' }, client: { type: 'string' } } }
@@ -1857,7 +1875,13 @@ async function executeTool(name, input) {
       if (platform === 'tiktok') return await getTikTokAnalytics();
       return await getFullAnalyticsDashboard(days);
     }
-    case 'connect_instagram':         return await connectInstagram(input.access_token);
+    case 'connect_metricool': {
+      CONFIG.metricool = { userToken: input.user_token, userId: input.user_id, blogId: input.blog_id };
+      fs.writeFileSync(path.join(__dirname, 'config.json'), JSON.stringify(CONFIG, null, 2));
+      const test = await getInstagramAnalytics(7);
+      if (test.includes('❌')) return `Credentials saved but test failed: ${test}`;
+      return `✅ Metricool connected! Analytics are live. Try "show my analytics"`;
+    }
     case 'generate_caption':          return await generateCaption(input.topic, input.client || '');
     case 'generate_content_calendar': return await generateContentCalendar(input.client);
     case 'update_config':             return updateConfig(input.key, input.value);
