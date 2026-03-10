@@ -154,9 +154,9 @@ const JT_BUSINESS_CLIENTS = [
   { name: 'Jess Richards', niche: 'podcast/content', package: '1x podcast/week + 1x reel', value: '$1,000/month' },
   { name: 'CoreCoach', niche: 'fitness app', package: '24x short form/month', value: '$3,900/month' },
   { name: 'Morgan', niche: 'podcast', package: '1x podcast/week', value: '$350/week' },
-  { name: 'Kingbodies', niche: 'fitness coaching', package: '15 videos/month', value: '$2,700/month' },
-  { name: 'Harry Drew', niche: 'fitness coaching', package: '10 videos/month', value: '$1,900/month' },
-  { name: 'Pantry Girl', niche: 'food/lifestyle', package: '10 videos/month', value: '$2,200/month' },
+  { name: 'Kingbodies', niche: 'fitness coaching', package: '15 short form videos/month', value: '$2,700/month' },
+  { name: 'Harry Drew', niche: 'fitness coaching', package: '10 short form videos/month', value: '$1,900/month' },
+  { name: 'Pantry Girl', niche: 'organisation and cleaning service', package: '10 short form videos/month', value: '$2,200/month' },
 ];
 
 // ─── WIN TRACKER ──────────────────────────────────────────────────────────────
@@ -510,6 +510,189 @@ ALL RETAINERS INCLUDE: VIP onboarding, Notion dashboard, monthly strategy call.
 HOT LEAD: fitness/online coach, $2k+/month budget. WARM: $1-2k. PASS: under $1k.
 ALWAYS check with Jackson before sending any quote.
 `;
+
+// ─── CLOSE RATE TRACKER ───────────────────────────────────────────────────────
+const SALES_PATH = path.join(__dirname, 'sales-pipeline.json');
+
+function loadSales() {
+  if (fs.existsSync(SALES_PATH)) { try { return JSON.parse(fs.readFileSync(SALES_PATH)); } catch(e) {} }
+  return { calls: [] };
+}
+
+function logSalesCall(name, outcome, value, reason, notes) {
+  const data = loadSales();
+  data.calls.unshift({ id: Date.now(), date: new Date().toISOString(), name, outcome, value: value || '', reason: reason || '', notes: notes || '' });
+  fs.writeFileSync(SALES_PATH, JSON.stringify(data, null, 2));
+  return outcome === 'closed'
+    ? `Win logged Boss! ${name} closed${value ? ' at ' + value : ''}. Log it as a win too with "log win".`
+    : `Loss logged. ${name} — reason: ${reason || 'not specified'}.`;
+}
+
+function getCloseRateReport() {
+  const data = loadSales();
+  if (!data.calls.length) return 'No sales calls logged yet Boss. Use "log close" or "log lost" to start tracking.';
+  const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+  const recent = data.calls.filter(c => new Date(c.date) > thirtyDaysAgo);
+  const all = data.calls;
+  const calcRate = (calls) => {
+    const closed = calls.filter(c => c.outcome === 'closed').length;
+    return calls.length ? `${Math.round(closed / calls.length * 100)}% (${closed}/${calls.length})` : 'No data';
+  };
+  const reasons = all.filter(c => c.outcome === 'lost' && c.reason).reduce((acc, c) => {
+    acc[c.reason] = (acc[c.reason] || 0) + 1; return acc;
+  }, {});
+  const topReasons = Object.entries(reasons).sort((a,b) => b[1]-a[1]).slice(0,3).map(([r,n]) => `${r} (${n}x)`).join(', ');
+  return `Sales pipeline Boss:\n\nLast 30 days: ${calcRate(recent)}\nAll time: ${calcRate(all)}\n\nTop loss reasons: ${topReasons || 'None logged'}\n\nRecent calls:\n${recent.slice(0,5).map(c => `• ${c.name} — ${c.outcome === 'closed' ? '✅ ' + (c.value||'closed') : '❌ ' + (c.reason||'lost')}`).join('\n')}`;
+}
+
+// ─── CLIENT RENEWAL TRACKER ───────────────────────────────────────────────────
+const RENEWALS_PATH = path.join(__dirname, 'renewals.json');
+
+function loadRenewals() {
+  if (fs.existsSync(RENEWALS_PATH)) { try { return JSON.parse(fs.readFileSync(RENEWALS_PATH)); } catch(e) {} }
+  return {};
+}
+
+function setRenewal(clientName, dateStr) {
+  const renewals = loadRenewals();
+  const client = JT_BUSINESS_CLIENTS.find(c => c.name.toLowerCase().includes(clientName.toLowerCase())) || { name: clientName };
+  renewals[client.name] = { date: dateStr, clientName: client.name, setAt: new Date().toISOString() };
+  fs.writeFileSync(RENEWALS_PATH, JSON.stringify(renewals, null, 2));
+  return `Renewal set for ${client.name} on ${dateStr}.`;
+}
+
+function getRenewals() {
+  const renewals = loadRenewals();
+  const entries = Object.values(renewals);
+  if (!entries.length) return 'No renewal dates set yet Boss. Use "set renewal: [client], [date]".';
+  const now = Date.now();
+  const sorted = entries.map(r => ({ ...r, daysUntil: Math.ceil((new Date(r.date) - now) / 86400000) }))
+    .sort((a,b) => a.daysUntil - b.daysUntil);
+  return 'Client renewals Boss:\n\n' + sorted.map(r => {
+    const flag = r.daysUntil <= 7 ? '🔴' : r.daysUntil <= 30 ? '🟡' : '✅';
+    return `${flag} ${r.clientName}: ${r.date} (${r.daysUntil > 0 ? r.daysUntil + ' days' : 'OVERDUE'})`;
+  }).join('\n');
+}
+
+async function checkRenewalAlerts() {
+  const renewals = loadRenewals();
+  const now = Date.now();
+  for (const r of Object.values(renewals)) {
+    const daysUntil = Math.ceil((new Date(r.date) - now) / 86400000);
+    if (daysUntil === 30) await sendToJackson(`Renewal reminder Boss: ${r.clientName} renews in 30 days (${r.date}). Time to check in and lock them in.`);
+    if (daysUntil === 7) await sendToJackson(`Renewal alert Boss: ${r.clientName} renews in 7 days (${r.date}). Get this confirmed now.`);
+    if (daysUntil === 1) await sendToJackson(`Renewal tomorrow Boss: ${r.clientName} is up for renewal tomorrow (${r.date}).`);
+  }
+}
+
+// ─── PRE-PRODUCTION CHECKLIST ─────────────────────────────────────────────────
+const PREPROD_PATH = path.join(__dirname, 'preprod-checklists.json');
+
+function loadPreprod() {
+  if (fs.existsSync(PREPROD_PATH)) { try { return JSON.parse(fs.readFileSync(PREPROD_PATH)); } catch(e) {} }
+  return {};
+}
+
+function createPreprodChecklist(clientName, shootDate, notes) {
+  const preprod = loadPreprod();
+  const id = `${clientName}-${shootDate}`.replace(/\s+/g, '-').toLowerCase();
+  const client = JT_BUSINESS_CLIENTS.find(c => c.name.toLowerCase().includes(clientName.toLowerCase())) || { name: clientName, package: 'content' };
+  preprod[id] = {
+    id, clientName: client.name, shootDate, notes: notes || '',
+    createdAt: new Date().toISOString(),
+    assetsReceived: false, briefReceived: false, locationConfirmed: false, callBooked: false
+  };
+  fs.writeFileSync(PREPROD_PATH, JSON.stringify(preprod, null, 2));
+
+  const checklist = `Pre-production checklist — ${client.name} (${shootDate}):
+
+Please send through before the shoot:
+1. Key talking points or scripts for this shoot
+2. Any B-roll or reference footage you want matched
+3. Brand assets (logo, colours) if not already supplied
+4. Location confirmation and access details
+5. Any specific requests or changes from last shoot
+
+Reply here when each is ready and we will get everything set up for a smooth shoot day.`;
+
+  return { message: `Checklist created for ${client.name} on ${shootDate}. Send this to client:`, checklist };
+}
+
+async function checkOverduePreprod() {
+  const preprod = loadPreprod();
+  const now = Date.now();
+  for (const item of Object.values(preprod)) {
+    if (item.assetsReceived) continue;
+    const shootMs = new Date(item.shootDate).getTime();
+    const hoursUntil = (shootMs - now) / 3600000;
+    if (hoursUntil <= 48 && hoursUntil > 0) {
+      await sendToJackson(`Pre-production alert Boss: ${item.clientName} shoot is in ${Math.round(hoursUntil)}h and assets haven't been marked as received. Chase them up now.`);
+    }
+  }
+}
+
+// ─── LEAD NURTURE TRACKER ─────────────────────────────────────────────────────
+const NURTURE_PATH = path.join(__dirname, 'lead-nurture.json');
+
+function loadNurture() {
+  if (fs.existsSync(NURTURE_PATH)) { try { return JSON.parse(fs.readFileSync(NURTURE_PATH)); } catch(e) {} }
+  return [];
+}
+
+function addNurtureLead(name, contact, niche, budget, source, notes) {
+  const leads = loadNurture();
+  const lead = {
+    id: Date.now(), name, contact: contact || '', niche: niche || '', budget: budget || '',
+    source: source || '', notes: notes || '', status: 'active',
+    createdAt: new Date().toISOString(), lastContact: new Date().toISOString(),
+    touchpoints: [], nextFollowUp: null
+  };
+  leads.unshift(lead);
+  fs.writeFileSync(NURTURE_PATH, JSON.stringify(leads, null, 2));
+
+  // Schedule follow-ups at day 1, 3, 7, 14, 30
+  const qualification = budget && (budget.includes('2k') || budget.includes('3k') || budget.includes('4k') || budget.includes('5k') || parseInt(budget.replace(/\D/g,'')) >= 2000) ? 'HOT' : 'WARM';
+  return `Lead added Boss: ${name} (${qualification}). Follow-up sequence started — day 1, 3, 7, 14, 30.`;
+}
+
+async function checkNurtureFollowUps() {
+  const leads = loadNurture().filter(l => l.status === 'active');
+  const now = Date.now();
+  const sequence = [1, 3, 7, 14, 30];
+
+  for (const lead of leads) {
+    const daysSince = Math.floor((now - new Date(lead.lastContact).getTime()) / 86400000);
+    for (const day of sequence) {
+      if (daysSince >= day && !lead.touchpoints.includes(day)) {
+        const touchNum = sequence.indexOf(day) + 1;
+        const prompt = `Draft a short follow-up WhatsApp/text message from Jackson Edwards (JT Visuals Gold Coast) to ${lead.name}, a potential client who hasn't responded in ${daysSince} days.
+Niche: ${lead.niche || 'business owner'}. Budget: ${lead.budget || 'unknown'}. Source: ${lead.source || 'inbound'}.
+Notes: ${lead.notes || 'Interested in video content retainer'}
+This is follow-up #${touchNum} of 5. JT Visuals does premium video content from $2,200/month.
+Casual, no pressure, value-focused. Australian tone. Under 3 sentences. Just the message, nothing else.`;
+        const r = await axios.post('https://api.anthropic.com/v1/messages',
+          { model: MODEL_LOW, max_tokens: 150, messages: [{ role: 'user', content: prompt }] },
+          { headers: { 'x-api-key': CONFIG.claude.apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' } });
+        await sendToJackson(`Lead follow-up due Boss — ${lead.name} (day ${daysSince}):\n\n"${r.data.content[0].text}"\n\nSend this to ${lead.contact || 'them'} or reply "nurture done ${lead.id}" to mark as contacted.`);
+        lead.touchpoints.push(day);
+        break;
+      }
+    }
+    if (daysSince >= 30 && lead.touchpoints.length >= sequence.length) lead.status = 'inactive';
+  }
+  const updated = loadNurture().map(l => { const u = leads.find(x => x.id === l.id); return u || l; });
+  fs.writeFileSync(NURTURE_PATH, JSON.stringify(updated, null, 2));
+}
+
+function getNurtureLeads() {
+  const leads = loadNurture();
+  const active = leads.filter(l => l.status === 'active');
+  if (!active.length) return 'No active leads in nurture sequence Boss.';
+  return 'Active leads in nurture:\n\n' + active.map(l => {
+    const days = Math.floor((Date.now() - new Date(l.createdAt).getTime()) / 86400000);
+    return `• ${l.name} (${l.niche || 'unknown'}, ${l.budget || 'budget unknown'}) — day ${days}, ${l.touchpoints.length} touchpoints`;
+  }).join('\n');
+}
 
 // ─── FIREFLIES ────────────────────────────────────────────────────────────────
 function firefliesQuery(query, variables = {}) {
@@ -1155,6 +1338,21 @@ async function doMarketResearch() {
 // ─── AGENT TOOLS ──────────────────────────────────────────────────────────────
 const TOOLS = [
   { name: 'get_mrr',                 description: 'Get current MRR breakdown across all active clients', input_schema: { type: 'object', properties: {}, required: [] } },
+  { name: 'log_sales_call',          description: 'Log a sales call outcome — closed or lost',
+    input_schema: { type: 'object', required: ['name','outcome'], properties: { name: { type: 'string' }, outcome: { type: 'string', description: '"closed" or "lost"' }, value: { type: 'string', description: 'e.g. $3,500/month' }, reason: { type: 'string', description: 'Why they lost or won' }, notes: { type: 'string' } } }
+  },
+  { name: 'get_close_rate',          description: 'Get sales close rate report and pipeline breakdown', input_schema: { type: 'object', properties: {}, required: [] } },
+  { name: 'set_renewal',             description: 'Set a client renewal date',
+    input_schema: { type: 'object', required: ['client','date'], properties: { client: { type: 'string' }, date: { type: 'string', description: 'YYYY-MM-DD' } } }
+  },
+  { name: 'get_renewals',            description: 'Get all client renewal dates and alerts', input_schema: { type: 'object', properties: {}, required: [] } },
+  { name: 'create_preprod',          description: 'Create a pre-production checklist for an upcoming shoot',
+    input_schema: { type: 'object', required: ['client','shoot_date'], properties: { client: { type: 'string' }, shoot_date: { type: 'string', description: 'YYYY-MM-DD' }, notes: { type: 'string' } } }
+  },
+  { name: 'add_nurture_lead',        description: 'Add a lead to the nurture follow-up sequence (day 1, 3, 7, 14, 30)',
+    input_schema: { type: 'object', required: ['name'], properties: { name: { type: 'string' }, contact: { type: 'string' }, niche: { type: 'string' }, budget: { type: 'string' }, source: { type: 'string' }, notes: { type: 'string' } } }
+  },
+  { name: 'get_nurture_leads',       description: 'Get all active leads in the nurture sequence', input_schema: { type: 'object', properties: {}, required: [] } },
   { name: 'analyse_calls',           description: 'Analyse recent Fireflies sales calls for patterns, objections, and what closes deals', input_schema: { type: 'object', properties: {}, required: [] } },
   { name: 'get_response_times',      description: 'Get WhatsApp response time report for all active clients', input_schema: { type: 'object', properties: {}, required: [] } },
   { name: 'get_group_tasks',         description: 'Get open action items detected from client WhatsApp groups', input_schema: { type: 'object', properties: {}, required: [] } },
@@ -1241,6 +1439,16 @@ const TOOLS = [
 async function executeTool(name, input) {
   switch (name) {
     case 'get_mrr':                   return getMRR();
+    case 'log_sales_call':            return logSalesCall(input.name, input.outcome, input.value||'', input.reason||'', input.notes||'');
+    case 'get_close_rate':            return getCloseRateReport();
+    case 'set_renewal':               return setRenewal(input.client, input.date);
+    case 'get_renewals':              return getRenewals();
+    case 'create_preprod': {
+      const result = createPreprodChecklist(input.client, input.shoot_date, input.notes||'');
+      return `${result.message}\n\n${result.checklist}`;
+    }
+    case 'add_nurture_lead':          return addNurtureLead(input.name, input.contact||'', input.niche||'', input.budget||'', input.source||'', input.notes||'');
+    case 'get_nurture_leads':         return getNurtureLeads();
     case 'analyse_calls':             return await analysePastCalls();
     case 'get_response_times':        return getResponseTimeReport();
     case 'get_group_tasks':           return await getOpenGroupTasks();
@@ -1328,14 +1536,38 @@ async function executeTool(name, input) {
 }
 
 // ─── AGENT LOOP ───────────────────────────────────────────────────────────────
+function getBusinessContext() {
+  const p = path.join(__dirname, 'business-context.json');
+  if (fs.existsSync(p)) { try { return JSON.parse(fs.readFileSync(p)); } catch(e) {} }
+  return {};
+}
+
 async function runAgentLoop(userMessage) {
   const writingStyle = getJacksonWritingStyle();
   const memoryContext = getMemoryContext();
+  const biz = getBusinessContext();
   const nowBrisbane = new Intl.DateTimeFormat('en-AU', { timeZone: 'Australia/Brisbane', weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: true }).format(new Date());
   const system = `You are the AI Chief of Staff for Jackson Edwards, owner of JT Visuals videography agency in Gold Coast, Australia.
 
 CURRENT DATE/TIME (Brisbane): ${nowBrisbane}
 When scheduling anything, always use this as "now" and calculate dates from it. Never guess the year.
+
+BUSINESS CONTEXT:
+Revenue target: $1,000,000/year. Current MRR: $36,800/month. Short-term target: $12,000/month minimum, $15,000/month PT package side.
+Lead sources: referrals, website inbound, social media. No close rate tracked yet.
+Ideal clients: fitness coaches, online PTs, construction, real estate — on retainer, organised, growth-focused.
+
+TEAM:
+- Tina (PA): backend systems, admin, calendar, client profiles, dashboards
+- Anthony (Editor, France): post-production, daily editing tasks, content delivery
+- Anik (Editor): post-production, daily editing tasks, EOD delivery
+
+DELIVERY PROCESS: Pre-production → Shoot → Frame.io upload → Editor assigns → Internal review → Revisions → Client review → Final delivery
+Biggest bottleneck: missing files/B-roll not supplied right after shoot.
+
+TOOLS STACK: Frame.io, Monday.com, Dropbox, Slack, Zapier, Pixieset, Adobe Premiere Pro, GHL, Notion, Google Calendar, Tally.so
+
+AUTOMATION PRIORITIES: client follow-up, task handoff, analytics reporting, caption QC, meeting notes, Notion page creation, production bottleneck reduction.
 
 JACKSON'S WRITING STYLE:
 ${writingStyle ? writingStyle.substring(0, 800) : 'Casual, direct, professional but friendly.'}
@@ -1990,16 +2222,26 @@ async function runDevTask(instruction) {
   try { ({ query } = require('@anthropic-ai/claude-agent-sdk')); }
   catch(e) { return 'Claude Code SDK not installed Boss. Run: npm install @anthropic-ai/claude-agent-sdk'; }
 
+  // Auto-restart after code changes
+  const needsRestart = /install|npm|package|require|new feature|add.*tool|implement/i.test(instruction);
+
   let output = '';
   const toolsUsed = new Set();
 
   for await (const message of query({
-    prompt: `You are modifying the JT Visuals Chief of Staff server (${path.join(__dirname, 'server.js')}).
+    prompt: `You are autonomously improving the JT Visuals Chief of Staff server (${path.join(__dirname, 'server.js')}).
+Working directory: ${__dirname}
 Task: ${instruction}
-Be surgical — only change what is needed. After making changes, summarise what you changed in 2-3 plain text sentences. No markdown.`,
+
+Rules:
+- If the task requires an npm package, run: npm install <package> --save
+- If you need to research something, use WebSearch or WebFetch to find the best approach
+- Read the existing server.js first to understand the patterns before editing
+- Be surgical — only change what is needed
+- After completing, summarise what you changed in 2-3 plain text sentences. No markdown.`,
     options: {
       cwd: __dirname,
-      allowedTools: ['Read', 'Edit', 'Write', 'Glob', 'Grep'],
+      allowedTools: ['Read', 'Edit', 'Write', 'Glob', 'Grep', 'Bash', 'WebSearch', 'WebFetch'],
       permissionMode: 'acceptEdits',
       allowDangerouslySkipPermissions: true,
       env: { ANTHROPIC_API_KEY: CONFIG.claude.apiKey, ...process.env },
@@ -2014,8 +2256,15 @@ Be surgical — only change what is needed. After making changes, summarise what
   }
 
   const summary = output.trim().substring(0, 900);
-  const tools = toolsUsed.size ? `\nFiles touched via: ${[...toolsUsed].join(', ')}` : '';
-  return (summary || 'Done Boss.') + tools;
+  const tools = toolsUsed.size ? `\nTools used: ${[...toolsUsed].join(', ')}` : '';
+  const result = (summary || 'Done Boss.') + tools;
+
+  // Auto-restart if packages were installed or code was changed significantly
+  if (needsRestart) {
+    setTimeout(() => restartServer(), 3000);
+    return result + '\n\nRestarting server to apply changes...';
+  }
+  return result;
 }
 
 app.post('/chief', async (req, res) => {
@@ -2381,6 +2630,9 @@ app.listen(PORT, async () => {
   startEmailChecker();
   scheduleDaily(() => 17, () => 0, sendDailyResponseReport, 'Daily Response Time Report');
   scheduleDaily(() => 8, () => 0, checkClientGroupTasks, 'Morning Group Task Scan');
+  scheduleDaily(() => 8, () => 30, checkRenewalAlerts, 'Renewal Alerts');
+  scheduleDaily(() => 8, () => 30, checkNurtureFollowUps, 'Lead Nurture Follow-ups');
+  scheduleDaily(() => 8, () => 30, checkOverduePreprod, 'Pre-production Asset Check');
   scheduleDaily(() => 13, () => 0, checkClientGroupTasks, 'Afternoon Group Task Scan');
   scheduleDaily(() => 17, () => 0, checkClientGroupTasks, 'Evening Group Task Scan');
   scheduleDaily(() => 21, () => 0, checkClientGroupTasks, 'Night Group Task Scan');
