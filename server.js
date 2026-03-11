@@ -1651,6 +1651,31 @@ async function createCalendarEvent(summary, startTime, endTime, description = ''
   return `Event created: ${res.data.summary}`;
 }
 
+async function deleteCalendarEvent(searchTerm, date = null) {
+  try {
+    const auth = getGoogleAuth();
+    if (!auth) return 'Google Calendar not connected.';
+    const calendar = google.calendar({ version: 'v3', auth });
+    const timeMin = date ? new Date(date + 'T00:00:00') : new Date();
+    timeMin.setDate(timeMin.getDate() - 7); // search back 7 days by default
+    const timeMax = new Date(timeMin); timeMax.setDate(timeMax.getDate() + 60);
+    const res = await calendar.events.list({
+      calendarId: 'primary', timeMin: timeMin.toISOString(), timeMax: timeMax.toISOString(),
+      q: searchTerm, singleEvents: true, maxResults: 10
+    });
+    const events = res.data.items || [];
+    if (!events.length) return `No events found matching "${searchTerm}".`;
+    if (events.length === 1) {
+      await calendar.events.delete({ calendarId: 'primary', eventId: events[0].id });
+      return `✅ Deleted: "${events[0].summary}"`;
+    }
+    // Multiple matches — delete the closest one
+    const sorted = events.sort((a,b) => new Date(a.start.dateTime||a.start.date) - new Date(b.start.dateTime||b.start.date));
+    await calendar.events.delete({ calendarId: 'primary', eventId: sorted[0].id });
+    return `✅ Deleted: "${sorted[0].summary}" on ${new Date(sorted[0].start.dateTime||sorted[0].start.date).toLocaleDateString('en-AU')}`;
+  } catch(e) { return `Calendar delete error: ${e.message}`; }
+}
+
 // ─── GMAIL ────────────────────────────────────────────────────────────────────
 async function getUnreadEmails(max = 8) {
   const auth = getGoogleAuth();
@@ -1891,6 +1916,69 @@ async function addGHLContactNote(contactId, note) {
   }
 }
 
+const GHL_PIPELINES = {
+  sales:   { id: 'EE1U9nWnxfuXgivFcSXe', name: 'Sales Pipeline',     stages: { 'new lead': '95c24930-e6db-42da-8553-e40dd6ef72a0', 'call booked': '258b2bd3-066d-4685-8a6b-29e52fca19d5', 'paid': '4e1dc721-492c-41fa-8b5e-97d3da518bc2', 'shoot booked': 'bb7bf228-615e-43e4-a9d0-3dd53753b4ec', 'lost': 'f9262368-6424-47c5-9003-9f56e6c0b7df' } },
+  editing: { id: 'wXoVKnrp4kBQxwtIwdlS', name: 'Editing/Production', stages: { 'shoot booked': 'b1ddbed4-4ba9-46a7-8b32-63c8de5a28e9', 'files uploaded': 'c514ccf7-516c-41b8-a7d3-7d1d71ddf467', 'editing started': '79a014d1-5464-4b28-9276-61a8801ad037', '50% complete': 'df5fc2f9-7cfd-4e69-94d8-2cc093b98436', 'internal review': '56bc4baa-e5cc-4716-ac37-ec4353e89fe3', 'ready for review': 'f0b40d2e-5627-47d0-a04b-5123e260358d', 'editor revisions': '94c6284c-b200-40dc-b238-c1cc006b1ddf', 'completed': 'f0ef4bb5-bbe1-4585-a466-0076f7b1f383' } },
+};
+
+async function createGHLOpportunity(contactName, contactPhone, title, pipeline, stage, value) {
+  try {
+    const headers = { 'Authorization': `Bearer ${CONFIG.ghl.apiKey}`, 'Version': '2021-07-28', 'Content-Type': 'application/json' };
+    const pipeKey = pipeline?.toLowerCase().includes('edit') ? 'editing' : 'sales';
+    const pip = GHL_PIPELINES[pipeKey];
+    const stageKey = (stage || '').toLowerCase();
+    const stageId = pip.stages[stageKey] || pip.stages['new lead'] || Object.values(pip.stages)[0];
+    const contactId = await findOrCreateGHLContact(contactName, contactPhone || '', '');
+
+    const body = {
+      pipelineId: pip.id,
+      locationId: CONFIG.ghl.locationId,
+      name: title || `${contactName} — ${pip.name}`,
+      pipelineStageId: stageId,
+      status: 'open',
+    };
+    if (contactId) body.contactId = contactId;
+    if (value) body.monetaryValue = parseFloat(String(value).replace(/[^0-9.]/g,'')) || 0;
+
+    const res = await axios.post('https://services.leadconnectorhq.com/opportunities/', body, { headers });
+    const opp = res.data?.opportunity || res.data;
+    return `✅ Opportunity created in GHL!\n\n*${body.name}*\nPipeline: ${pip.name}\nStage: ${stage || 'New Lead'}${value ? `\nValue: $${body.monetaryValue.toLocaleString()}` : ''}`;
+  } catch(e) { return `GHL opportunity error: ${e.response?.data?.message || e.message}`; }
+}
+
+// ─── SMS ──────────────────────────────────────────────────────────────────────
+async function sendSMS(to, message) {
+  try {
+    const fromNumber = CONFIG.twilio?.smsNumber;
+    if (!fromNumber) return '❌ No SMS number configured. Add twilio.smsNumber to config.json (your Twilio phone number, e.g. +61412345678).';
+    const toFormatted = to.startsWith('+') ? to : `+61${to.replace(/^0/,'')}`;
+    const client = require('twilio')(CONFIG.twilio.accountSid, CONFIG.twilio.authToken);
+    const msg = await client.messages.create({ body: message, from: fromNumber, to: toFormatted });
+    return `✅ SMS sent to ${toFormatted} (SID: ${msg.sid})`;
+  } catch(e) { return `SMS error: ${e.message}`; }
+}
+
+// ─── VOICE TRANSCRIPTION ──────────────────────────────────────────────────────
+async function transcribeAudio(mediaUrl) {
+  try {
+    const deepgramKey = CONFIG.deepgram?.apiKey;
+    if (!deepgramKey) return null;
+    // Download audio from Twilio (needs auth)
+    const audioRes = await axios.get(mediaUrl, {
+      responseType: 'arraybuffer',
+      auth: { username: CONFIG.twilio.accountSid, password: CONFIG.twilio.authToken }
+    });
+    const audioBuffer = Buffer.from(audioRes.data);
+    // Send to Deepgram
+    const res = await axios.post(
+      'https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&language=en-AU',
+      audioBuffer,
+      { headers: { 'Authorization': `Token ${deepgramKey}`, 'Content-Type': audioRes.headers['content-type'] || 'audio/ogg' } }
+    );
+    return res.data?.results?.channels?.[0]?.alternatives?.[0]?.transcript || null;
+  } catch(e) { console.error('Transcription error:', e.message); return null; }
+}
+
 // ─── FRAME.IO V4 OAuth ────────────────────────────────────────────────────────
 const FRAMEIO_CLIENT_ID = process.env.FRAMEIO_CLIENT_ID || CONFIG.frameio?.clientId || '';
 const FRAMEIO_CLIENT_SECRET = process.env.FRAMEIO_CLIENT_SECRET || CONFIG.frameio?.clientSecret || '';
@@ -2125,6 +2213,22 @@ const TOOLS = [
   { name: 'get_xero_status',         description: 'Check what Xero CSV files have been uploaded and when',
     input_schema: { type: 'object', properties: {}, required: [] }
   },
+  { name: 'delete_calendar_event',   description: 'Delete a Google Calendar event by searching for it by name or keyword',
+    input_schema: { type: 'object', required: ['search'], properties: { search: { type: 'string', description: 'Name or keyword of the event to delete' }, date: { type: 'string', description: 'Optional: date to narrow search (YYYY-MM-DD)' } } }
+  },
+  { name: 'send_sms',                description: 'Send an SMS text message to any phone number via Twilio',
+    input_schema: { type: 'object', required: ['to','message'], properties: { to: { type: 'string', description: 'Phone number e.g. 0412345678 or +61412345678' }, message: { type: 'string', description: 'The SMS message to send' } } }
+  },
+  { name: 'create_ghl_opportunity',  description: 'Create a new opportunity/deal in GoHighLevel CRM — use for new leads or production jobs',
+    input_schema: { type: 'object', required: ['contact_name','title'], properties: {
+      contact_name:  { type: 'string', description: 'Name of the contact/client' },
+      contact_phone: { type: 'string', description: 'Phone number (optional, used to find/create contact)' },
+      title:         { type: 'string', description: 'Opportunity title e.g. "Alpha Physiques — Monthly Retainer"' },
+      pipeline:      { type: 'string', description: '"sales" or "editing" — default sales' },
+      stage:         { type: 'string', description: 'Sales: "new lead", "call booked", "paid", "shoot booked", "lost" | Editing: "shoot booked", "files uploaded", "editing started", "50% complete", "internal review", "ready for review", "editor revisions", "completed"' },
+      value:         { type: 'string', description: 'Monetary value e.g. "3500" or "$3,500/month"' }
+    }}
+  },
   { name: 'web_research',            description: 'Search the web to research anything — competitor pricing, industry trends, platform changes, lead intel, tools, news. Use this whenever Jackson asks to look something up, research a topic, or find information you don\'t know.',
     input_schema: { type: 'object', required: ['query'], properties: {
       query: { type: 'string', description: 'What to search for' },
@@ -2241,6 +2345,9 @@ async function executeTool(name, input) {
       return await analyseXeroCSV(filePath);
     }
     case 'get_xero_status':           return await getXeroUploadStatus();
+    case 'delete_calendar_event':     return await deleteCalendarEvent(input.search, input.date || null);
+    case 'send_sms':                  return await sendSMS(input.to, input.message);
+    case 'create_ghl_opportunity':    return await createGHLOpportunity(input.contact_name, input.contact_phone || '', input.title, input.pipeline || 'sales', input.stage || 'new lead', input.value || '');
     case 'get_xero_pnl':              return await getXeroPnL(input.months || 3);
     case 'get_xero_expenses':         return await getXeroExpenses(input.days || 30);
     case 'get_xero_invoices':         return await getXeroInvoices(input.status || 'AUTHORISED', input.days || 30);
@@ -3018,9 +3125,30 @@ app.post('/chief', async (req, res) => {
   }
   res.status(200).send('OK');
   try {
-    const incomingMsg = req.body.Body;
+    let incomingMsg = req.body.Body;
     const senderNumber = req.body.From;
-    if (!incomingMsg || senderNumber !== CONFIG.owner.whatsapp) return;
+    if (senderNumber !== CONFIG.owner.whatsapp) return;
+
+    // ── Voice message transcription ───────────────────────────────────────────
+    if (!incomingMsg && parseInt(req.body.NumMedia || '0') > 0) {
+      const mediaType = req.body.MediaContentType0 || '';
+      const mediaUrl  = req.body.MediaUrl0 || '';
+      if (mediaType.startsWith('audio/') && mediaUrl) {
+        if (!CONFIG.deepgram?.apiKey) {
+          await sendToJackson('🎤 Voice message received but Deepgram not connected. Add deepgram.apiKey to config to enable transcription.');
+          return;
+        }
+        await sendToJackson('🎤 Transcribing voice message...');
+        const transcript = await transcribeAudio(mediaUrl);
+        if (!transcript) { await sendToJackson('Could not transcribe that voice message Boss.'); return; }
+        await sendToJackson(`🎤 *Transcription:* "${transcript}"`);
+        incomingMsg = transcript; // treat transcript as text command
+      } else {
+        return; // non-audio media, ignore
+      }
+    }
+
+    if (!incomingMsg) return;
 
     const msgLower = incomingMsg.toLowerCase().trim();
     if (msgLower === "mrr" || msgLower === "revenue" || msgLower === "monthly revenue") { await sendToJackson(getMRR()); return; }
