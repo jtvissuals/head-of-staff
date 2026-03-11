@@ -1217,7 +1217,10 @@ ${deep
 // Keep alias for backward compatibility
 async function webSearchFallback(query) { return webSearch(query, false); }
 
-// ─── XERO INTEGRATION ─────────────────────────────────────────────────────────
+// ─── XERO FINANCIAL ANALYSIS (CSV-BASED) ──────────────────────────────────────
+const XERO_UPLOADS_PATH = path.join(__dirname, 'xero-uploads');
+if (!fs.existsSync(XERO_UPLOADS_PATH)) fs.mkdirSync(XERO_UPLOADS_PATH);
+
 const XERO_TOKEN_PATH = path.join(__dirname, 'xero-token.json');
 const XERO_API = 'https://api.xero.com/api.xro/2.0';
 const XERO_SCOPES = 'offline_access openid profile accounting.reports.read accounting.reports.profitandloss.read accounting.invoices.read accounting.banktransactions.read accounting.payments.read accounting.accounts.read accounting.contacts';
@@ -1440,6 +1443,117 @@ async function getXeroInvoices(status = 'AUTHORISED', days = 30) {
     if (e.message.includes('not connected')) return e.message;
     return `Xero invoices error: ${e.response?.data?.Detail || e.message}`;
   }
+}
+
+function parseXeroCSV(csvText) {
+  const lines = csvText.split('\n').map(l => l.trim()).filter(Boolean);
+  if (!lines.length) return [];
+  const headers = lines[0].split(',').map(h => h.replace(/"/g,'').trim());
+  return lines.slice(1).map(line => {
+    // Handle quoted commas
+    const cols = [];
+    let cur = '', inQ = false;
+    for (const ch of line) {
+      if (ch === '"') { inQ = !inQ; }
+      else if (ch === ',' && !inQ) { cols.push(cur.trim()); cur = ''; }
+      else { cur += ch; }
+    }
+    cols.push(cur.trim());
+    const obj = {};
+    headers.forEach((h, i) => { obj[h] = (cols[i] || '').replace(/"/g,'').trim(); });
+    return obj;
+  });
+}
+
+function getLatestXeroFile(type = 'any') {
+  // type: 'pnl', 'transactions', 'any'
+  const files = fs.readdirSync(XERO_UPLOADS_PATH)
+    .filter(f => f.endsWith('.csv'))
+    .filter(f => type === 'any' || f.toLowerCase().includes(type))
+    .map(f => ({ name: f, mtime: fs.statSync(path.join(XERO_UPLOADS_PATH, f)).mtime }))
+    .sort((a, b) => b.mtime - a.mtime);
+  return files.length ? path.join(XERO_UPLOADS_PATH, files[0].name) : null;
+}
+
+async function analyseXeroCSV(filePath) {
+  try {
+    const raw = fs.readFileSync(filePath, 'utf8');
+    const rows = parseXeroCSV(raw);
+    if (!rows.length) return 'CSV appears empty or unreadable.';
+
+    // Detect file type by headers
+    const headers = Object.keys(rows[0]).map(h => h.toLowerCase());
+    const isPnL = headers.some(h => h.includes('account type') || h.includes('gross profit') || h.includes('net profit'));
+    const isTransactions = headers.some(h => h.includes('amount') && h.includes('description'));
+
+    const businessCtx = getBusinessContext();
+    const mrr = getMRR();
+
+    let dataStr = '';
+    if (isPnL) {
+      // P&L: summarise by section
+      dataStr = `P&L REPORT:\n${raw.substring(0, 6000)}`;
+    } else if (isTransactions) {
+      // Transactions: group by payee and sum
+      const grouped = {};
+      let totalSpend = 0;
+      for (const row of rows) {
+        const amt = parseFloat((row['Amount'] || row['Net Amount'] || row['Debit'] || '0').replace(/[$,()]/g,'')) || 0;
+        const name = row['Description'] || row['Payee'] || row['Contact'] || row['Merchant'] || 'Unknown';
+        if (amt > 0) {
+          grouped[name] = (grouped[name] || 0) + amt;
+          totalSpend += amt;
+        }
+      }
+      const sorted = Object.entries(grouped).sort((a,b) => b[1]-a[1]);
+      dataStr = `EXPENSE TRANSACTIONS (${rows.length} rows, total $${totalSpend.toFixed(2)}):\n`;
+      sorted.slice(0, 30).forEach(([k,v]) => { dataStr += `${k}: $${v.toFixed(2)}\n`; });
+    } else {
+      dataStr = `RAW DATA (${rows.length} rows):\n${raw.substring(0, 5000)}`;
+    }
+
+    const prompt = `You are a no-bullshit financial advisor reviewing the books for JT Visuals — a videography agency run by Jackson Edwards in Gold Coast, Australia.
+
+CURRENT MRR: ${mrr}
+TARGET: $1M revenue in 2026
+
+TEAM COSTS: Jackson (owner/director), Tina (PA, Australia), Anthony (full-time editor, France), Anik (editor, part-time)
+
+${dataStr}
+
+Provide a sharp financial analysis:
+
+1. **Margin health** — What is the current profit margin? Is it acceptable for a creative agency (benchmark: 20–35% net)? Be direct.
+
+2. **Top cost concerns** — Which specific line items are too high or suspicious? Give dollar amounts.
+
+3. **Cut immediately** — 3 expenses to cancel or reduce right now. Be specific with names and amounts.
+
+4. **Renegotiate** — What should be renegotiated (software, wages, subscriptions)?
+
+5. **Revenue lever** — One thing to do this month to improve margin without adding clients.
+
+6. **Wage efficiency** — Are staff costs proportionate to revenue? Flag anything out of line.
+
+Be direct, use numbers, give specific actions. No vague advice.`;
+
+    const r = await axios.post('https://api.anthropic.com/v1/messages',
+      { model: MODEL_HIGH, max_tokens: 1200, messages: [{ role: 'user', content: prompt }] },
+      { headers: { 'x-api-key': CONFIG.claude.apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' } }
+    );
+    return r.data.content[0]?.text || 'Analysis failed.';
+  } catch (e) { return `Analysis error: ${e.message}`; }
+}
+
+async function getXeroUploadStatus() {
+  const files = fs.readdirSync(XERO_UPLOADS_PATH).filter(f => f.endsWith('.csv'));
+  if (!files.length) return '📂 No Xero files uploaded yet.\n\nTo get started:\n1. In Xero → Reports → Profit & Loss → Export as CSV\n2. Also export: Accounting → Bank Transactions → Export CSV\n3. Upload both files to: https://nonvalidly-unbudgeted-theresa.ngrok-free.dev/xero-upload';
+
+  const details = files.map(f => {
+    const stat = fs.statSync(path.join(XERO_UPLOADS_PATH, f));
+    return `• ${f} (${(stat.size/1024).toFixed(0)}KB, uploaded ${stat.mtime.toLocaleDateString('en-AU')})`;
+  });
+  return `📂 Xero files on file:\n${details.join('\n')}\n\nSay "analyse my finances" to run the analysis.`;
 }
 
 // ─── MEMORY ───────────────────────────────────────────────────────────────────
@@ -2005,19 +2119,10 @@ const TOOLS = [
   { name: 'generate_hooks',          description: 'Generate video hook lines for a topic',
     input_schema: { type: 'object', required: ['topic'], properties: { topic: { type: 'string' }, count: { type: 'number' } } }
   },
-  { name: 'get_xero_pnl',            description: 'Get Profit & Loss report from Xero — revenue, expenses, profit margin breakdown',
-    input_schema: { type: 'object', properties: { months: { type: 'number', description: 'Number of months to look back (default 3)' } }, required: [] }
+  { name: 'analyse_xero_financials', description: 'Analyse uploaded Xero CSV files — P&L, expenses, profit margin — with AI recommendations to cut costs and improve margins. Use when Jackson asks about finances, expenses, profit, or money.',
+    input_schema: { type: 'object', properties: {}, required: [] }
   },
-  { name: 'analyse_xero_financials', description: 'Deep financial analysis of Xero P&L and expenses with AI recommendations on reducing costs and improving profit margin',
-    input_schema: { type: 'object', properties: { months: { type: 'number', description: 'Months to analyse (default 3)' } }, required: [] }
-  },
-  { name: 'get_xero_expenses',       description: 'Get recent expense transactions from Xero grouped by vendor',
-    input_schema: { type: 'object', properties: { days: { type: 'number', description: 'Days to look back (default 30)' } }, required: [] }
-  },
-  { name: 'get_xero_invoices',       description: 'Get invoices from Xero — outstanding, overdue, or paid',
-    input_schema: { type: 'object', properties: { status: { type: 'string', description: '"AUTHORISED" (outstanding), "OVERDUE", "PAID" — default AUTHORISED' }, days: { type: 'number' } }, required: [] }
-  },
-  { name: 'connect_xero',            description: 'Generate a Xero OAuth link and send to Jackson to authenticate',
+  { name: 'get_xero_status',         description: 'Check what Xero CSV files have been uploaded and when',
     input_schema: { type: 'object', properties: {}, required: [] }
   },
   { name: 'web_research',            description: 'Search the web to research anything — competitor pricing, industry trends, platform changes, lead intel, tools, news. Use this whenever Jackson asks to look something up, research a topic, or find information you don\'t know.',
@@ -2130,16 +2235,15 @@ async function executeTool(name, input) {
     case 'draft_client_reply':        return await draftClientReply(input.client, input.question);
     case 'generate_reel_ideas':       return await generateReelIdeas(input.client, input.count || 8);
     case 'generate_hooks':            return await generateHooks(input.topic, input.count || 8);
+    case 'analyse_xero_financials': {
+      const filePath = getLatestXeroFile('any');
+      if (!filePath) return '❌ No Xero CSV uploaded yet. Go to:\nhttps://nonvalidly-unbudgeted-theresa.ngrok-free.dev/xero-upload\n\nExport your P&L or transactions from Xero → Reports → Export CSV, then upload it there.';
+      return await analyseXeroCSV(filePath);
+    }
+    case 'get_xero_status':           return await getXeroUploadStatus();
     case 'get_xero_pnl':              return await getXeroPnL(input.months || 3);
-    case 'analyse_xero_financials':   return await analyseXeroFinancials(input.months || 3);
     case 'get_xero_expenses':         return await getXeroExpenses(input.days || 30);
     case 'get_xero_invoices':         return await getXeroInvoices(input.status || 'AUTHORISED', input.days || 30);
-    case 'connect_xero': {
-      const xero = CONFIG.xero || {};
-      if (!xero.clientId) return '❌ Add xero.clientId and xero.clientSecret to config.json first.';
-      const link = `https://nonvalidly-unbudgeted-theresa.ngrok-free.dev/xero-auth`;
-      return `Open this link to connect Xero Boss:\n${link}\n\nLog in with your Xero account and approve access. I'll message you when it's done.`;
-    }
     case 'web_research':              return await webSearch(input.query, input.deep || false);
     case 'get_analytics': {
       const days = input.days || 7;
@@ -3190,6 +3294,95 @@ app.get('/frameio/callback', async (req, res) => {
     await sendToJackson('Frame.io connected Boss! 🎬');
     res.send('<h2>Frame.io Connected!</h2><p>Close this tab and check WhatsApp.</p>');
   } catch(e) { res.send('Error: ' + e.message); }
+});
+
+// ─── XERO FILE UPLOAD ─────────────────────────────────────────────────────────
+app.get('/xero-upload', (req, res) => {
+  const files = fs.existsSync(XERO_UPLOADS_PATH)
+    ? fs.readdirSync(XERO_UPLOADS_PATH).filter(f => f.endsWith('.csv'))
+    : [];
+  const fileList = files.length
+    ? `<p style="color:#6c757d;font-size:14px">Files on file: ${files.join(', ')}</p>`
+    : `<p style="color:#6c757d;font-size:14px">No files uploaded yet.</p>`;
+
+  res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Upload Xero Export — JT Visuals</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; max-width: 520px; margin: 60px auto; padding: 20px; background: #f8f9fa; }
+    h2 { color: #1a1a2e; margin-bottom: 4px; }
+    p { color: #555; font-size: 15px; margin-top: 0; }
+    .card { background: white; border-radius: 12px; padding: 28px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); }
+    .steps { background: #f0f4ff; border-radius: 8px; padding: 16px 20px; margin: 16px 0; font-size: 14px; line-height: 1.9; }
+    input[type=file] { display: block; margin: 16px 0; font-size: 15px; }
+    button { background: #4f46e5; color: white; border: none; padding: 12px 28px; border-radius: 8px; font-size: 16px; cursor: pointer; width: 100%; }
+    button:hover { background: #4338ca; }
+    .success { color: #16a34a; font-weight: 600; }
+    .note { font-size: 13px; color: #888; margin-top: 12px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>📊 Xero Financial Upload</h2>
+    <p>Upload your Xero export for financial analysis via WhatsApp.</p>
+    <div class="steps">
+      <strong>How to export from Xero:</strong><br>
+      1. Xero → <b>Accounting → Reports → Profit & Loss</b><br>
+      2. Set date range → click <b>Export → CSV</b><br>
+      3. Also export: <b>Accounting → Bank Accounts → [account] → Export</b><br>
+      4. Upload both files below
+    </div>
+    <form action="/xero-upload" method="POST" enctype="multipart/form-data">
+      <input type="file" name="xeroFile" accept=".csv" multiple required>
+      <button type="submit">Upload & Analyse</button>
+    </form>
+    ${fileList}
+    <p class="note">Files are stored locally on your Mac only. Then message the bot: "analyse my finances"</p>
+  </div>
+</body>
+</html>`);
+});
+
+app.post('/xero-upload', express.raw({ type: '*/*', limit: '20mb' }), async (req, res) => {
+  // Parse multipart manually using boundary
+  try {
+    const contentType = req.headers['content-type'] || '';
+    const boundary = contentType.split('boundary=')[1];
+    if (!boundary) return res.status(400).send('Bad request');
+
+    const body = req.body.toString('binary');
+    const parts = body.split(`--${boundary}`).filter(p => p.includes('filename='));
+    const saved = [];
+
+    for (const part of parts) {
+      const headerEnd = part.indexOf('\r\n\r\n');
+      if (headerEnd === -1) continue;
+      const headers = part.substring(0, headerEnd);
+      const filenameMatch = headers.match(/filename="([^"]+)"/);
+      if (!filenameMatch) continue;
+      const filename = filenameMatch[1].replace(/[^a-zA-Z0-9._-]/g, '_');
+      const content = part.substring(headerEnd + 4).replace(/\r\n--.*$/s, '');
+      const savePath = path.join(XERO_UPLOADS_PATH, `${Date.now()}_${filename}`);
+      fs.writeFileSync(savePath, content, 'binary');
+      saved.push(filename);
+    }
+
+    if (!saved.length) return res.status(400).send('No valid CSV files found in upload.');
+
+    await sendToJackson(`✅ Xero file${saved.length > 1 ? 's' : ''} uploaded: ${saved.join(', ')}\n\nSay "analyse my finances" to get your full financial report.`);
+    res.send(`<!DOCTYPE html><html><body style="font-family:sans-serif;max-width:500px;margin:60px auto;padding:20px;text-align:center">
+      <h2 style="color:#16a34a">✅ Uploaded!</h2>
+      <p>Got: <strong>${saved.join(', ')}</strong></p>
+      <p>Check WhatsApp — say "analyse my finances" to get your report.</p>
+      <a href="/xero-upload" style="color:#4f46e5">Upload another file</a>
+    </body></html>`);
+  } catch(e) {
+    console.error('Xero upload error:', e.message);
+    res.status(500).send('Upload error: ' + e.message);
+  }
 });
 
 // ─── XERO AUTH ROUTES ─────────────────────────────────────────────────────────
