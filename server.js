@@ -2473,16 +2473,6 @@ const TOOLS = [
       valid_days:   { type: 'number', description: 'Days until proposal expires (default 14)' }
     }}
   },
-  { name: 'generate_invoice_pdf',    description: 'Generate a PDF invoice for a client and upload to Google Drive',
-    input_schema: { type: 'object', required: ['client_name','items'], properties: {
-      client_name:     { type: 'string' },
-      client_email:    { type: 'string' },
-      invoice_number:  { type: 'string', description: 'e.g. INV-042' },
-      items:           { type: 'array', items: { type: 'object', properties: { description: { type: 'string' }, amount: { type: 'string' } } } },
-      due_date:        { type: 'string', description: 'YYYY-MM-DD' },
-      notes:           { type: 'string' }
-    }}
-  },
   { name: 'generate_weekly_report_pdf', description: 'Generate a weekly business report PDF covering MRR, calendar, tasks, and leads',
     input_schema: { type: 'object', properties: {}, required: [] }
   },
@@ -2637,11 +2627,6 @@ async function executeTool(name, input) {
       const filePath = await generateQuotePDF({ clientName: input.client_name, clientEmail: input.client_email || '', packages: input.packages || [], notes: input.notes || '', validDays: input.valid_days || 14 });
       const driveUrl = await uploadPDFToDrive(filePath, path.basename(filePath));
       return driveUrl ? `✅ Quote PDF ready Boss!\n\n📄 ${driveUrl}` : `✅ Quote saved locally: ${filePath}`;
-    }
-    case 'generate_invoice_pdf': {
-      const filePath = await generateInvoicePDF({ clientName: input.client_name, clientEmail: input.client_email || '', invoiceNumber: input.invoice_number || '', items: input.items || [], dueDate: input.due_date || '', notes: input.notes || '' });
-      const driveUrl = await uploadPDFToDrive(filePath, path.basename(filePath));
-      return driveUrl ? `✅ Invoice PDF ready Boss!\n\n📄 ${driveUrl}` : `✅ Invoice saved locally: ${filePath}`;
     }
     case 'generate_weekly_report_pdf': {
       const filePath = await generateWeeklyReportPDF();
