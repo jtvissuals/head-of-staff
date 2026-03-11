@@ -1192,14 +1192,30 @@ Write ONLY the reply. Warm, professional, concise. 2-3 sentences. Sound like a r
   return r.data.content[0].text;
 }
 
-async function webSearchFallback(query) {
-  const prompt = `Search the web and answer this for Jackson Edwards, JT Visuals Gold Coast: "${query}". Concise — max 3 sentences.`;
+async function webSearch(query, deep = false) {
+  const prompt = `You are a research assistant for Jackson Edwards, owner of JT Visuals (videography agency, Gold Coast, Australia).
+
+Research query: "${query}"
+
+${deep
+  ? 'Do a thorough search. Summarise findings clearly with bullet points, key stats, and any actionable takeaways relevant to a videography business.'
+  : 'Give a concise, direct answer. Max 4-5 bullet points or 3 short paragraphs. Facts and specifics only — no padding.'
+}`;
   const r = await axios.post('https://api.anthropic.com/v1/messages',
-    { model: MODEL_LOW, max_tokens: 300, tools: [{ type: 'web_search_20250305', name: 'web_search' }], messages: [{ role: 'user', content: prompt }] },
-    { headers: { 'x-api-key': CONFIG.claude.apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' } });
+    {
+      model: deep ? MODEL_MID : MODEL_LOW,
+      max_tokens: deep ? 1200 : 500,
+      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+      messages: [{ role: 'user', content: prompt }]
+    },
+    { headers: { 'x-api-key': CONFIG.claude.apiKey, 'anthropic-version': '2023-06-01', 'anthropic-beta': 'web-search-2025-03-05', 'content-type': 'application/json' } }
+  );
   const text = r.data.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
   return text || 'Could not find that information Boss.';
 }
+
+// Keep alias for backward compatibility
+async function webSearchFallback(query) { return webSearch(query, false); }
 
 // ─── MEMORY ───────────────────────────────────────────────────────────────────
 const MEMORY_PATH = path.join(__dirname, 'memory.json');
@@ -1764,6 +1780,12 @@ const TOOLS = [
   { name: 'generate_hooks',          description: 'Generate video hook lines for a topic',
     input_schema: { type: 'object', required: ['topic'], properties: { topic: { type: 'string' }, count: { type: 'number' } } }
   },
+  { name: 'web_research',            description: 'Search the web to research anything — competitor pricing, industry trends, platform changes, lead intel, tools, news. Use this whenever Jackson asks to look something up, research a topic, or find information you don\'t know.',
+    input_schema: { type: 'object', required: ['query'], properties: {
+      query: { type: 'string', description: 'What to search for' },
+      deep:  { type: 'boolean', description: 'true for thorough research with bullet points and analysis, false (default) for a quick direct answer' }
+    }}
+  },
   { name: 'get_analytics',           description: 'Get Instagram and TikTok analytics dashboard — follower count, reach, impressions, top posts',
     input_schema: { type: 'object', properties: { days: { type: 'number', description: 'Number of days to look back (default 7)' }, platform: { type: 'string', description: '"instagram", "tiktok", or "all" (default all)' } }, required: [] }
   },
@@ -1868,6 +1890,7 @@ async function executeTool(name, input) {
     case 'draft_client_reply':        return await draftClientReply(input.client, input.question);
     case 'generate_reel_ideas':       return await generateReelIdeas(input.client, input.count || 8);
     case 'generate_hooks':            return await generateHooks(input.topic, input.count || 8);
+    case 'web_research':              return await webSearch(input.query, input.deep || false);
     case 'get_analytics': {
       const days = input.days || 7;
       const platform = (input.platform || 'all').toLowerCase();
