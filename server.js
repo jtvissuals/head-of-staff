@@ -1217,6 +1217,231 @@ ${deep
 // Keep alias for backward compatibility
 async function webSearchFallback(query) { return webSearch(query, false); }
 
+// ─── XERO INTEGRATION ─────────────────────────────────────────────────────────
+const XERO_TOKEN_PATH = path.join(__dirname, 'xero-token.json');
+const XERO_API = 'https://api.xero.com/api.xro/2.0';
+const XERO_SCOPES = 'offline_access openid profile accounting.reports.read accounting.reports.profitandloss.read accounting.invoices.read accounting.banktransactions.read accounting.payments.read accounting.accounts.read accounting.contacts';
+
+function loadXeroToken() {
+  if (fs.existsSync(XERO_TOKEN_PATH)) {
+    try { return JSON.parse(fs.readFileSync(XERO_TOKEN_PATH)); } catch(e) {}
+  }
+  return null;
+}
+
+function saveXeroToken(data) {
+  fs.writeFileSync(XERO_TOKEN_PATH, JSON.stringify(data, null, 2));
+}
+
+async function getValidXeroToken() {
+  const t = loadXeroToken();
+  if (!t) throw new Error('Xero not connected. Ask Jackson to run "connect xero".');
+
+  // Refresh if expired or within 5 min of expiry
+  if (Date.now() >= t.expiresAt - 300000) {
+    const xero = CONFIG.xero || {};
+    const r = await axios.post('https://identity.xero.com/connect/token',
+      new URLSearchParams({ grant_type: 'refresh_token', refresh_token: t.refreshToken, client_id: xero.clientId, client_secret: xero.clientSecret }).toString(),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+    const fresh = {
+      accessToken: r.data.access_token,
+      refreshToken: r.data.refresh_token,
+      expiresAt: Date.now() + r.data.expires_in * 1000,
+      tenantId: t.tenantId,
+    };
+    saveXeroToken(fresh);
+    return fresh;
+  }
+  return t;
+}
+
+async function xeroAPI(endpoint, params = {}) {
+  const token = await getValidXeroToken();
+  const r = await axios.get(`${XERO_API}${endpoint}`, {
+    params,
+    headers: {
+      'Authorization': `Bearer ${token.accessToken}`,
+      'Xero-Tenant-Id': token.tenantId,
+      'Accept': 'application/json',
+    }
+  });
+  return r.data;
+}
+
+async function getXeroPnL(months = 3) {
+  try {
+    const now = new Date();
+    const from = new Date(now.getFullYear(), now.getMonth() - months, 1);
+    const fmt = d => d.toISOString().slice(0,10);
+    const data = await xeroAPI('/Reports/ProfitAndLoss', {
+      fromDate: fmt(from),
+      toDate: fmt(now),
+      standardLayout: true
+    });
+
+    const report = data.Reports?.[0];
+    if (!report) return 'No P&L data found.';
+
+    let income = 0, expenses = 0;
+    const expenseLines = [];
+
+    for (const section of report.Rows || []) {
+      if (!section.Rows) continue;
+      const sectionTitle = section.Title || '';
+      for (const row of section.Rows) {
+        if (row.RowType === 'Row' && row.Cells) {
+          const name = row.Cells[0]?.Value || '';
+          const amount = parseFloat(row.Cells[1]?.Value?.replace(/,/g,'') || '0');
+          if (!isNaN(amount) && amount !== 0) {
+            if (sectionTitle.toLowerCase().includes('income') || sectionTitle.toLowerCase().includes('revenue')) {
+              income += amount;
+            } else if (sectionTitle.toLowerCase().includes('expense') || sectionTitle.toLowerCase().includes('cost')) {
+              expenses += amount;
+              if (name) expenseLines.push({ name, amount });
+            }
+          }
+        }
+        if (row.RowType === 'SummaryRow' && row.Cells) {
+          const label = row.Cells[0]?.Value?.toLowerCase() || '';
+          const val = parseFloat(row.Cells[1]?.Value?.replace(/,/g,'') || '0');
+          if (label.includes('total income') || label.includes('total revenue')) income = val;
+          if (label.includes('total operating') || label.includes('total expenses')) expenses = val;
+        }
+      }
+    }
+
+    const profit = income - expenses;
+    const margin = income > 0 ? ((profit / income) * 100).toFixed(1) : 0;
+
+    let out = `💰 *P&L Summary — Last ${months} Months*\n\n`;
+    out += `📈 Revenue: $${income.toLocaleString('en-AU', {minimumFractionDigits:2,maximumFractionDigits:2})}\n`;
+    out += `📉 Expenses: $${expenses.toLocaleString('en-AU', {minimumFractionDigits:2,maximumFractionDigits:2})}\n`;
+    out += `💵 Net Profit: $${profit.toLocaleString('en-AU', {minimumFractionDigits:2,maximumFractionDigits:2})}\n`;
+    out += `📊 Profit Margin: ${margin}%\n`;
+
+    if (expenseLines.length) {
+      const sorted = expenseLines.sort((a,b) => b.amount - a.amount);
+      out += `\n*Top expenses:*\n`;
+      sorted.slice(0,8).forEach(e => {
+        const pct = income > 0 ? ((e.amount/income)*100).toFixed(1) : '—';
+        out += `• ${e.name}: $${e.amount.toLocaleString('en-AU',{minimumFractionDigits:2,maximumFractionDigits:2})} (${pct}% of revenue)\n`;
+      });
+    }
+    return out;
+  } catch (e) {
+    if (e.message.includes('not connected')) return e.message;
+    return `Xero P&L error: ${e.response?.data?.Detail || e.message}`;
+  }
+}
+
+async function getXeroExpenses(days = 30) {
+  try {
+    const since = new Date(Date.now() - days * 86400000).toISOString().slice(0,10);
+    const data = await xeroAPI('/BankTransactions', {
+      Type: 'SPEND',
+      where: `Date >= DateTime(${since.replace(/-/g,'/')})`,
+      order: 'Date DESC'
+    });
+
+    const txns = data.BankTransactions || [];
+    if (!txns.length) return `No expense transactions found in the last ${days} days.`;
+
+    // Group by contact/description
+    const grouped = {};
+    let total = 0;
+    for (const t of txns) {
+      const key = t.Contact?.Name || t.Reference || 'Unknown';
+      if (!grouped[key]) grouped[key] = 0;
+      grouped[key] += t.Total || 0;
+      total += t.Total || 0;
+    }
+
+    const sorted = Object.entries(grouped).sort((a,b) => b[1]-a[1]);
+    let out = `💳 *Expenses — Last ${days} Days*\n\n`;
+    out += `Total spend: $${total.toLocaleString('en-AU',{minimumFractionDigits:2})}\n`;
+    out += `Transactions: ${txns.length}\n\n`;
+    out += `*By vendor:*\n`;
+    sorted.slice(0,10).forEach(([name, amt]) => {
+      out += `• ${name}: $${amt.toLocaleString('en-AU',{minimumFractionDigits:2})}\n`;
+    });
+    return out;
+  } catch (e) {
+    if (e.message.includes('not connected')) return e.message;
+    return `Xero expenses error: ${e.response?.data?.Detail || e.message}`;
+  }
+}
+
+async function analyseXeroFinancials(months = 3) {
+  try {
+    const [pnl, expenses] = await Promise.all([
+      getXeroPnL(months),
+      getXeroExpenses(months * 30)
+    ]);
+
+    const businessCtx = getBusinessContext();
+    const mrr = getMRR();
+
+    const prompt = `You are a financial advisor reviewing the books for JT Visuals, a videography agency in Gold Coast Australia.
+
+CURRENT MRR: ${mrr}
+P&L DATA:
+${pnl}
+
+EXPENSE DETAIL:
+${expenses}
+
+BUSINESS CONTEXT:
+- Team: Jackson (owner), Tina (PA), Anthony (editor, France), Anik (editor)
+- Target: $1M revenue in 2026
+- Current MRR: ~$36,800
+
+Provide a sharp financial analysis covering:
+1. Profit margin assessment — is it healthy for an agency this size? (industry benchmark is 20-35%)
+2. Top 3 expense categories that are too high or questionable — be specific
+3. Quick wins — costs to cut or renegotiate immediately
+4. Structural improvements — pricing, billing cycles, wage efficiency
+5. One revenue lever to improve margin without more clients
+
+Be direct and specific. No fluff. Use dollar amounts where possible.`;
+
+    const r = await axios.post('https://api.anthropic.com/v1/messages',
+      { model: MODEL_HIGH, max_tokens: 1000, messages: [{ role: 'user', content: prompt }] },
+      { headers: { 'x-api-key': CONFIG.claude.apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' } }
+    );
+    const analysis = r.data.content[0]?.text || 'Could not generate analysis.';
+    return `${pnl}\n\n─────────────────\n\n🧠 *Financial Analysis:*\n\n${analysis}`;
+  } catch (e) { return `Analysis error: ${e.message}`; }
+}
+
+async function getXeroInvoices(status = 'AUTHORISED', days = 30) {
+  try {
+    const since = new Date(Date.now() - days * 86400000).toISOString().slice(0,10);
+    const data = await xeroAPI('/Invoices', {
+      Statuses: status,
+      where: `Date >= DateTime(${since.replace(/-/g,'/')})`,
+      order: 'DueDate ASC'
+    });
+    const invoices = data.Invoices || [];
+    if (!invoices.length) return `No ${status.toLowerCase()} invoices in the last ${days} days.`;
+
+    let out = `🧾 *Invoices (${status}) — Last ${days} Days*\n\n`;
+    let total = 0;
+    invoices.forEach(inv => {
+      const due = inv.DueDate ? new Date(inv.DueDate.replace(/\/Date\((\d+)[+-]/,'$1')).toLocaleDateString('en-AU') : '—';
+      const amt = inv.Total || 0;
+      total += amt;
+      const overdue = inv.IsOverdue ? ' ⚠️ OVERDUE' : '';
+      out += `• ${inv.Contact?.Name || 'Unknown'} — $${amt.toLocaleString('en-AU',{minimumFractionDigits:2})} due ${due}${overdue}\n`;
+    });
+    out += `\nTotal: $${total.toLocaleString('en-AU',{minimumFractionDigits:2})}`;
+    return out;
+  } catch (e) {
+    if (e.message.includes('not connected')) return e.message;
+    return `Xero invoices error: ${e.response?.data?.Detail || e.message}`;
+  }
+}
+
 // ─── MEMORY ───────────────────────────────────────────────────────────────────
 const MEMORY_PATH = path.join(__dirname, 'memory.json');
 
@@ -1780,6 +2005,21 @@ const TOOLS = [
   { name: 'generate_hooks',          description: 'Generate video hook lines for a topic',
     input_schema: { type: 'object', required: ['topic'], properties: { topic: { type: 'string' }, count: { type: 'number' } } }
   },
+  { name: 'get_xero_pnl',            description: 'Get Profit & Loss report from Xero — revenue, expenses, profit margin breakdown',
+    input_schema: { type: 'object', properties: { months: { type: 'number', description: 'Number of months to look back (default 3)' } }, required: [] }
+  },
+  { name: 'analyse_xero_financials', description: 'Deep financial analysis of Xero P&L and expenses with AI recommendations on reducing costs and improving profit margin',
+    input_schema: { type: 'object', properties: { months: { type: 'number', description: 'Months to analyse (default 3)' } }, required: [] }
+  },
+  { name: 'get_xero_expenses',       description: 'Get recent expense transactions from Xero grouped by vendor',
+    input_schema: { type: 'object', properties: { days: { type: 'number', description: 'Days to look back (default 30)' } }, required: [] }
+  },
+  { name: 'get_xero_invoices',       description: 'Get invoices from Xero — outstanding, overdue, or paid',
+    input_schema: { type: 'object', properties: { status: { type: 'string', description: '"AUTHORISED" (outstanding), "OVERDUE", "PAID" — default AUTHORISED' }, days: { type: 'number' } }, required: [] }
+  },
+  { name: 'connect_xero',            description: 'Generate a Xero OAuth link and send to Jackson to authenticate',
+    input_schema: { type: 'object', properties: {}, required: [] }
+  },
   { name: 'web_research',            description: 'Search the web to research anything — competitor pricing, industry trends, platform changes, lead intel, tools, news. Use this whenever Jackson asks to look something up, research a topic, or find information you don\'t know.',
     input_schema: { type: 'object', required: ['query'], properties: {
       query: { type: 'string', description: 'What to search for' },
@@ -1890,6 +2130,16 @@ async function executeTool(name, input) {
     case 'draft_client_reply':        return await draftClientReply(input.client, input.question);
     case 'generate_reel_ideas':       return await generateReelIdeas(input.client, input.count || 8);
     case 'generate_hooks':            return await generateHooks(input.topic, input.count || 8);
+    case 'get_xero_pnl':              return await getXeroPnL(input.months || 3);
+    case 'analyse_xero_financials':   return await analyseXeroFinancials(input.months || 3);
+    case 'get_xero_expenses':         return await getXeroExpenses(input.days || 30);
+    case 'get_xero_invoices':         return await getXeroInvoices(input.status || 'AUTHORISED', input.days || 30);
+    case 'connect_xero': {
+      const xero = CONFIG.xero || {};
+      if (!xero.clientId) return '❌ Add xero.clientId and xero.clientSecret to config.json first.';
+      const link = `https://nonvalidly-unbudgeted-theresa.ngrok-free.dev/xero-auth`;
+      return `Open this link to connect Xero Boss:\n${link}\n\nLog in with your Xero account and approve access. I'll message you when it's done.`;
+    }
     case 'web_research':              return await webSearch(input.query, input.deep || false);
     case 'get_analytics': {
       const days = input.days || 7;
@@ -2940,6 +3190,60 @@ app.get('/frameio/callback', async (req, res) => {
     await sendToJackson('Frame.io connected Boss! 🎬');
     res.send('<h2>Frame.io Connected!</h2><p>Close this tab and check WhatsApp.</p>');
   } catch(e) { res.send('Error: ' + e.message); }
+});
+
+// ─── XERO AUTH ROUTES ─────────────────────────────────────────────────────────
+app.get('/xero-auth', (req, res) => {
+  const xero = CONFIG.xero || {};
+  if (!xero.clientId) return res.send('Xero clientId not set in config.json');
+  const state = Math.random().toString(36).slice(2);
+  const url = `https://login.xero.com/identity/connect/authorize?` +
+    `client_id=${xero.clientId}` +
+    `&response_type=code` +
+    `&scope=${encodeURIComponent(XERO_SCOPES)}` +
+    `&redirect_uri=${encodeURIComponent(xero.redirectUri)}` +
+    `&state=${state}`;
+  res.redirect(url);
+});
+
+app.get('/xero-callback', async (req, res) => {
+  const { code, error } = req.query;
+  if (error) return res.send(`Xero auth error: ${error}`);
+  if (!code) return res.send('No code received.');
+  try {
+    const xero = CONFIG.xero || {};
+    // Exchange code for tokens
+    const tokenRes = await axios.post('https://identity.xero.com/connect/token',
+      new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: xero.redirectUri,
+        client_id: xero.clientId,
+        client_secret: xero.clientSecret
+      }).toString(),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+    // Get tenant (organisation) ID
+    const connRes = await axios.get('https://api.xero.com/connections', {
+      headers: { 'Authorization': `Bearer ${tokenRes.data.access_token}`, 'Content-Type': 'application/json' }
+    });
+    const tenant = connRes.data?.[0];
+    if (!tenant) { res.send('No Xero organisations found.'); return; }
+
+    saveXeroToken({
+      accessToken: tokenRes.data.access_token,
+      refreshToken: tokenRes.data.refresh_token,
+      expiresAt: Date.now() + tokenRes.data.expires_in * 1000,
+      tenantId: tenant.tenantId,
+      orgName: tenant.tenantName,
+    });
+
+    await sendToJackson(`✅ Xero connected! Organisation: *${tenant.tenantName}*\n\nYou can now ask:\n• "show my P&L"\n• "analyse my expenses"\n• "show outstanding invoices"`);
+    res.send('<h2>✅ Xero Connected!</h2><p>Close this tab and check WhatsApp.</p>');
+  } catch(e) {
+    console.error('Xero callback error:', e.response?.data || e.message);
+    res.send('Error connecting Xero: ' + (e.response?.data?.error_description || e.message));
+  }
 });
 
 // ─── SCHEDULER ────────────────────────────────────────────────────────────────
