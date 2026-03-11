@@ -880,6 +880,260 @@ async function sendWeeklyAnalyticsReport() {
   } catch (e) { console.error('Weekly analytics report error:', e.message); }
 }
 
+// ─── PDF & GOOGLE SHEETS GENERATION ──────────────────────────────────────────
+const PDFDocument = require('pdfkit');
+const EXPORTS_PATH = path.join(__dirname, 'exports');
+if (!fs.existsSync(EXPORTS_PATH)) fs.mkdirSync(EXPORTS_PATH);
+
+// ── PDF helpers ───────────────────────────────────────────────────────────────
+function createPDFDoc(filename) {
+  const doc = new PDFDocument({ margin: 50, size: 'A4' });
+  const filePath = path.join(EXPORTS_PATH, filename);
+  const stream = fs.createWriteStream(filePath);
+  doc.pipe(stream);
+  return { doc, filePath, stream };
+}
+
+function pdfHeader(doc, title, subtitle = '') {
+  doc.fontSize(22).font('Helvetica-Bold').text('JT VISUALS', 50, 50);
+  doc.fontSize(10).font('Helvetica').fillColor('#888888').text('jtvissuals.com.au  |  Gold Coast, Australia', 50, 78);
+  doc.moveTo(50, 95).lineTo(545, 95).strokeColor('#cccccc').stroke();
+  doc.moveDown(1.5).fillColor('#000000').fontSize(18).font('Helvetica-Bold').text(title);
+  if (subtitle) doc.fontSize(11).font('Helvetica').fillColor('#555555').text(subtitle).moveDown(0.5);
+  doc.fillColor('#000000').moveDown(0.5);
+}
+
+function pdfSectionTitle(doc, text) {
+  doc.moveDown(0.8).fontSize(12).font('Helvetica-Bold').fillColor('#1a1a2e').text(text.toUpperCase());
+  doc.moveTo(50, doc.y + 2).lineTo(545, doc.y + 2).strokeColor('#e0e0e0').stroke().moveDown(0.5);
+  doc.fillColor('#000000');
+}
+
+function pdfRow(doc, label, value, highlight = false) {
+  if (highlight) doc.rect(48, doc.y - 2, 497, 18).fill('#f5f5f5').fillColor('#000000');
+  doc.fontSize(10).font('Helvetica-Bold').text(label, 52, doc.y, { continued: true, width: 250 });
+  doc.font('Helvetica').text(value, { align: 'right' }).moveDown(0.2);
+}
+
+function finalisePDF(doc, stream, filePath) {
+  return new Promise(resolve => {
+    stream.on('finish', () => resolve(filePath));
+    doc.end();
+  });
+}
+
+// ── Quote / Proposal PDF ──────────────────────────────────────────────────────
+async function generateQuotePDF({ clientName, clientEmail = '', packages = [], notes = '', validDays = 14 }) {
+  const filename = `quote_${clientName.replace(/\s+/g,'_')}_${Date.now()}.pdf`;
+  const { doc, filePath, stream } = createPDFDoc(filename);
+  const date = new Date().toLocaleDateString('en-AU', { day: 'numeric', month: 'long', year: 'numeric' });
+  const validUntil = new Date(Date.now() + validDays * 86400000).toLocaleDateString('en-AU', { day: 'numeric', month: 'long', year: 'numeric' });
+
+  pdfHeader(doc, 'SERVICE PROPOSAL', `Prepared for ${clientName}  |  ${date}`);
+  if (clientEmail) doc.fontSize(10).text(`Contact: ${clientEmail}`).moveDown(0.5);
+
+  pdfSectionTitle(doc, 'Package Details');
+  let total = 0;
+  packages.forEach((pkg, i) => {
+    const amt = parseFloat(String(pkg.price || 0).replace(/[^0-9.]/g,'')) || 0;
+    total += amt;
+    pdfRow(doc, pkg.name, `$${amt.toLocaleString('en-AU', {minimumFractionDigits:2})}`, i % 2 === 0);
+    if (pkg.description) doc.fontSize(9).fillColor('#666').text(`  ${pkg.description}`, 52).fillColor('#000').moveDown(0.1);
+  });
+
+  doc.moveDown(0.3).moveTo(50, doc.y).lineTo(545, doc.y).strokeColor('#000').stroke().moveDown(0.5);
+  doc.fontSize(13).font('Helvetica-Bold').text('TOTAL (per month)', { continued: true }).text(`$${total.toLocaleString('en-AU', {minimumFractionDigits:2})}`, { align: 'right' });
+
+  if (notes) {
+    pdfSectionTitle(doc, 'Notes');
+    doc.fontSize(10).font('Helvetica').text(notes);
+  }
+
+  pdfSectionTitle(doc, 'Terms');
+  doc.fontSize(10).font('Helvetica').text(`• This proposal is valid until ${validUntil}`);
+  doc.text('• 50% deposit required to commence. Balance due on delivery.');
+  doc.text('• Revisions included as per agreed package scope.');
+  doc.text('• Content calendar and shoot schedule provided upon confirmation.');
+  doc.moveDown(2).fontSize(10).fillColor('#888').text('To accept, simply reply to confirm and we will get started.', { align: 'center' });
+
+  return finalisePDF(doc, stream, filePath);
+}
+
+// ── Invoice PDF ───────────────────────────────────────────────────────────────
+async function generateInvoicePDF({ clientName, clientEmail = '', invoiceNumber, items = [], dueDate = '', notes = '' }) {
+  const filename = `invoice_${(invoiceNumber||Date.now()).toString().replace(/\s+/g,'_')}.pdf`;
+  const { doc, filePath, stream } = createPDFDoc(filename);
+  const date = new Date().toLocaleDateString('en-AU', { day: 'numeric', month: 'long', year: 'numeric' });
+  const due = dueDate ? new Date(dueDate).toLocaleDateString('en-AU', { day: 'numeric', month: 'long', year: 'numeric' }) : '14 days from invoice date';
+
+  pdfHeader(doc, `INVOICE #${invoiceNumber || 'INV-' + Date.now().toString().slice(-5)}`, date);
+
+  doc.fontSize(10).font('Helvetica-Bold').text('Bill To:').font('Helvetica').text(clientName);
+  if (clientEmail) doc.text(clientEmail);
+  doc.moveDown(0.3).font('Helvetica-Bold').text('Due Date: ', { continued: true }).font('Helvetica').text(due).moveDown(1);
+
+  pdfSectionTitle(doc, 'Services');
+  let subtotal = 0;
+  items.forEach((item, i) => {
+    const amt = parseFloat(String(item.amount || 0).replace(/[^0-9.]/g,'')) || 0;
+    subtotal += amt;
+    pdfRow(doc, item.description, `$${amt.toLocaleString('en-AU', {minimumFractionDigits:2})}`, i % 2 === 0);
+  });
+
+  const gst = subtotal * 0.1;
+  const total = subtotal + gst;
+  doc.moveDown(0.5);
+  pdfRow(doc, 'Subtotal', `$${subtotal.toLocaleString('en-AU', {minimumFractionDigits:2})}`);
+  pdfRow(doc, 'GST (10%)', `$${gst.toLocaleString('en-AU', {minimumFractionDigits:2})}`);
+  doc.moveDown(0.3).moveTo(50, doc.y).lineTo(545, doc.y).strokeColor('#000').stroke().moveDown(0.5);
+  doc.fontSize(13).font('Helvetica-Bold').text('TOTAL DUE', { continued: true }).text(`$${total.toLocaleString('en-AU', {minimumFractionDigits:2})}`, { align: 'right' });
+
+  pdfSectionTitle(doc, 'Payment Details');
+  doc.fontSize(10).font('Helvetica').text('BSB: [Your BSB]').text('Account: [Your Account Number]').text('Reference: ' + (invoiceNumber || clientName));
+  if (notes) { doc.moveDown(0.5).font('Helvetica-Bold').text('Notes:').font('Helvetica').text(notes); }
+
+  return finalisePDF(doc, stream, filePath);
+}
+
+// ── Weekly Report PDF ─────────────────────────────────────────────────────────
+async function generateWeeklyReportPDF() {
+  const filename = `weekly_report_${new Date().toISOString().slice(0,10)}.pdf`;
+  const { doc, filePath, stream } = createPDFDoc(filename);
+  const date = new Date().toLocaleDateString('en-AU', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+
+  pdfHeader(doc, 'WEEKLY BUSINESS REPORT', date);
+
+  pdfSectionTitle(doc, 'Revenue');
+  const mrr = getMRR();
+  doc.fontSize(10).font('Helvetica').text(mrr);
+
+  try {
+    pdfSectionTitle(doc, 'Calendar — This Week');
+    const cal = await getCalendarEvents();
+    doc.fontSize(10).font('Helvetica').text(cal.replace(/•/g, '-'));
+  } catch(e) {}
+
+  try {
+    pdfSectionTitle(doc, 'Open Monday Tasks');
+    const tasks = await getAllMondayTasks();
+    doc.fontSize(10).font('Helvetica').text(tasks.replace(/[*•]/g,'-').substring(0,1500));
+  } catch(e) {}
+
+  try {
+    pdfSectionTitle(doc, 'Active Leads');
+    const leads = await getStaleGHLLeads();
+    doc.fontSize(10).font('Helvetica').text(leads.replace(/•/g,'-'));
+  } catch(e) {}
+
+  doc.moveDown(2).fontSize(9).fillColor('#aaa').text('Generated by JT Visuals Chief of Staff', { align: 'center' });
+  return finalisePDF(doc, stream, filePath);
+}
+
+// ── Google Sheets helpers ─────────────────────────────────────────────────────
+async function createSheet(title, data, sheetName = 'Sheet1') {
+  const auth = getGoogleAuth();
+  if (!auth) throw new Error('Google not connected.');
+  const sheets = google.sheets({ version: 'v4', auth });
+  const drive  = google.drive({ version: 'v3', auth });
+
+  // Create spreadsheet
+  const ss = await sheets.spreadsheets.create({
+    resource: { properties: { title }, sheets: [{ properties: { title: sheetName } }] }
+  });
+  const ssId = ss.data.spreadsheetId;
+  const ssUrl = `https://docs.google.com/spreadsheets/d/${ssId}`;
+
+  // Write data
+  if (data.length) {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: ssId, range: `${sheetName}!A1`,
+      valueInputOption: 'USER_ENTERED', resource: { values: data }
+    });
+    // Bold the header row
+    await sheets.spreadsheets.batchUpdate({ spreadsheetId: ssId, resource: { requests: [{
+      repeatCell: { range: { sheetId: 0, startRowIndex: 0, endRowIndex: 1 },
+        cell: { userEnteredFormat: { textFormat: { bold: true }, backgroundColor: { red: 0.1, green: 0.1, blue: 0.18 }, horizontalAlignment: 'CENTER' } },
+        fields: 'userEnteredFormat(textFormat,backgroundColor,horizontalAlignment)' }
+    }] } });
+  }
+
+  // Make it viewable by link
+  await drive.permissions.create({ fileId: ssId, resource: { role: 'reader', type: 'anyone' } }).catch(() => {});
+  return ssUrl;
+}
+
+async function generateContentCalendarSheet(clientName, weeks = 4) {
+  const client = ACTIVE_CLIENTS_MRR.find(c => c.name.toLowerCase().includes(clientName.toLowerCase())) || { name: clientName };
+  const today = new Date();
+  const rows = [['Week', 'Date', 'Platform', 'Content Type', 'Topic / Hook', 'Caption Status', 'Filmed', 'Edited', 'Published', 'Notes']];
+  const platforms = ['Instagram Reel', 'TikTok', 'Instagram Reel', 'YouTube Short', 'Instagram Reel'];
+  const types = ['Educational', 'Behind the Scenes', 'Client Transformation', 'Trending Hook', 'Talking Head'];
+  for (let w = 0; w < weeks; w++) {
+    for (let d = 0; d < 5; d++) {
+      const date = new Date(today); date.setDate(today.getDate() + w * 7 + d);
+      rows.push([
+        `Week ${w+1}`,
+        date.toLocaleDateString('en-AU'),
+        platforms[d % platforms.length],
+        types[d % types.length],
+        '', '', '☐', '☐', '☐', ''
+      ]);
+    }
+  }
+  return createSheet(`${client.name} — Content Calendar ${today.toLocaleDateString('en-AU')}`, rows, 'Content Calendar');
+}
+
+async function generateProductionScheduleSheet() {
+  const rows = [['Client', 'Shoot Date', 'Editor', 'Files Uploaded', 'Edit Started', 'Internal Review', 'Client Review', 'Delivered', 'Status', 'Notes']];
+  for (const client of ACTIVE_CLIENTS_MRR) {
+    rows.push([client.name, '', '', '☐', '☐', '☐', '☐', '☐', 'Pending', '']);
+  }
+  return createSheet(`JT Visuals — Production Schedule ${new Date().toLocaleDateString('en-AU')}`, rows, 'Production');
+}
+
+async function generateExpenseSheet(months = 3) {
+  const rows = [['Date', 'Category', 'Vendor / Description', 'Amount (AUD)', 'GST', 'Total inc. GST', 'Notes', 'Billable to Client']];
+  const categories = ['Software', 'Wages', 'Equipment', 'Marketing', 'Travel', 'Other'];
+  // Blank rows ready to fill
+  for (let i = 0; i < 30; i++) rows.push(['', categories[i % categories.length], '', '', '', '', '', '']);
+  const url = await createSheet(`JT Visuals — Expenses ${new Date().toLocaleDateString('en-AU')}`, rows, 'Expenses');
+  return url;
+}
+
+async function generatePnLSheet() {
+  const rows = [
+    ['JT VISUALS — P&L TRACKER', '', '', '', ''],
+    ['', '', '', '', ''],
+    ['INCOME', 'Jan', 'Feb', 'Mar', 'Total'],
+  ];
+  for (const c of ACTIVE_CLIENTS_MRR) rows.push([c.name, c.mrr, c.mrr, c.mrr, `=B${rows.length+1}+C${rows.length+1}+D${rows.length+1}`]);
+  rows.push(['TOTAL INCOME', `=SUM(B4:B${rows.length})`, `=SUM(C4:C${rows.length})`, `=SUM(D4:D${rows.length})`, `=SUM(E4:E${rows.length})`]);
+  rows.push(['', '', '', '', '']);
+  rows.push(['EXPENSES', '', '', '', '']);
+  const expenseRows = [['Wages - Anthony', '', '', '', ''], ['Wages - Anik', '', '', '', ''], ['Wages - Tina', '', '', '', ''], ['Software & Subscriptions', '', '', '', ''], ['Equipment', '', '', '', ''], ['Marketing', '', '', '', ''], ['Other', '', '', '', '']];
+  expenseRows.forEach(r => rows.push(r));
+  const expStart = rows.length - expenseRows.length + 1;
+  rows.push(['TOTAL EXPENSES', `=SUM(B${expStart}:B${rows.length})`, `=SUM(C${expStart}:C${rows.length})`, `=SUM(D${expStart}:D${rows.length})`, `=SUM(E${expStart}:E${rows.length})`]);
+  rows.push(['', '', '', '', '']);
+  rows.push(['NET PROFIT', `=B${expenseRows.length+5}-B${rows.length-1}`, `=C${expenseRows.length+5}-C${rows.length-1}`, `=D${expenseRows.length+5}-D${rows.length-1}`, `=E${expenseRows.length+5}-E${rows.length-1}`]);
+  return createSheet('JT Visuals — P&L Tracker', rows, 'P&L');
+}
+
+async function uploadPDFToDrive(filePath, filename) {
+  try {
+    const auth = getGoogleAuth();
+    if (!auth) return null;
+    const drive = google.drive({ version: 'v3', auth });
+    const res = await drive.files.create({
+      resource: { name: filename, mimeType: 'application/pdf' },
+      media: { mimeType: 'application/pdf', body: fs.createReadStream(filePath) },
+      fields: 'id,webViewLink'
+    });
+    await drive.permissions.create({ fileId: res.data.id, resource: { role: 'reader', type: 'anyone' } });
+    return res.data.webViewLink;
+  } catch(e) { console.error('Drive upload error:', e.message); return null; }
+}
+
 // ─── MONDAY.COM ───────────────────────────────────────────────────────────────
 const MONDAY_BOARD_NAMES = {
   jackson: 'Jackson Tasks',
@@ -1571,7 +1825,7 @@ function saveMemory(messages) {
 }
 
 // ─── GOOGLE AUTH ──────────────────────────────────────────────────────────────
-const SCOPES = ['https://www.googleapis.com/auth/calendar', 'https://www.googleapis.com/auth/gmail.send', 'https://www.googleapis.com/auth/gmail.readonly'];
+const SCOPES = ['https://www.googleapis.com/auth/calendar', 'https://www.googleapis.com/auth/gmail.send', 'https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive.file'];
 const TOKEN_PATH = path.join(__dirname, 'google-token.json');
 const CREDENTIALS_PATH = path.join(__dirname, 'google-credentials.json');
 
@@ -1597,22 +1851,19 @@ function getGoogleAuth() {
   return _googleAuth;
 }
 
-async function authorizeGoogle() {
-  if (!fs.existsSync(CREDENTIALS_PATH)) return;
+function getGoogleAuthURL() {
+  if (!fs.existsSync(CREDENTIALS_PATH)) return null;
   const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH));
-  const { client_secret, client_id, redirect_uris } = credentials.installed;
-  const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
-  const authUrl = oAuth2Client.generateAuthUrl({ access_type: 'offline', scope: SCOPES });
-  console.log('\nAuthorize Google:\n', authUrl);
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  rl.question('\nEnter code: ', async (code) => {
-    rl.close();
-    const { tokens } = await oAuth2Client.getToken(code);
-    oAuth2Client.setCredentials(tokens);
-    fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokens));
-    console.log('Google token saved! Restart.');
-    process.exit(0);
-  });
+  const { client_secret, client_id } = credentials.installed;
+  const redirectUri = `https://nonvalidly-unbudgeted-theresa.ngrok-free.dev/google-callback`;
+  const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, redirectUri);
+  return { url: oAuth2Client.generateAuthUrl({ access_type: 'offline', scope: SCOPES, prompt: 'consent' }), client_id, client_secret, redirectUri };
+}
+
+async function authorizeGoogle() {
+  const result = getGoogleAuthURL();
+  if (!result) return;
+  console.log('\nAuthorize Google:\n', result.url);
 }
 
 // ─── CALENDAR ─────────────────────────────────────────────────────────────────
@@ -2213,6 +2464,43 @@ const TOOLS = [
   { name: 'get_xero_status',         description: 'Check what Xero CSV files have been uploaded and when',
     input_schema: { type: 'object', properties: {}, required: [] }
   },
+  { name: 'generate_quote_pdf',      description: 'Generate a professional PDF proposal/quote for a client and upload to Google Drive',
+    input_schema: { type: 'object', required: ['client_name','packages'], properties: {
+      client_name:  { type: 'string' },
+      client_email: { type: 'string' },
+      packages:     { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, price: { type: 'string' }, description: { type: 'string' } } }, description: 'List of packages/line items with name, price, and optional description' },
+      notes:        { type: 'string', description: 'Any additional notes to include' },
+      valid_days:   { type: 'number', description: 'Days until proposal expires (default 14)' }
+    }}
+  },
+  { name: 'generate_invoice_pdf',    description: 'Generate a PDF invoice for a client and upload to Google Drive',
+    input_schema: { type: 'object', required: ['client_name','items'], properties: {
+      client_name:     { type: 'string' },
+      client_email:    { type: 'string' },
+      invoice_number:  { type: 'string', description: 'e.g. INV-042' },
+      items:           { type: 'array', items: { type: 'object', properties: { description: { type: 'string' }, amount: { type: 'string' } } } },
+      due_date:        { type: 'string', description: 'YYYY-MM-DD' },
+      notes:           { type: 'string' }
+    }}
+  },
+  { name: 'generate_weekly_report_pdf', description: 'Generate a weekly business report PDF covering MRR, calendar, tasks, and leads',
+    input_schema: { type: 'object', properties: {}, required: [] }
+  },
+  { name: 'generate_content_calendar_sheet', description: 'Create a Google Sheets content calendar for a client with weeks of planned posts',
+    input_schema: { type: 'object', required: ['client'], properties: { client: { type: 'string' }, weeks: { type: 'number', description: 'Number of weeks (default 4)' } } }
+  },
+  { name: 'generate_production_schedule_sheet', description: 'Create a Google Sheets production schedule for all active clients',
+    input_schema: { type: 'object', properties: {}, required: [] }
+  },
+  { name: 'generate_expense_sheet',  description: 'Create a blank Google Sheets expense tracker ready to fill in',
+    input_schema: { type: 'object', properties: {}, required: [] }
+  },
+  { name: 'generate_pnl_sheet',      description: 'Create a Google Sheets P&L tracker pre-filled with all client MRR and expense categories',
+    input_schema: { type: 'object', properties: {}, required: [] }
+  },
+  { name: 'connect_google',          description: 'Generate a Google OAuth link to connect or reconnect Google (Calendar, Gmail, Sheets)',
+    input_schema: { type: 'object', properties: {}, required: [] }
+  },
   { name: 'delete_calendar_event',   description: 'Delete a Google Calendar event by searching for it by name or keyword',
     input_schema: { type: 'object', required: ['search'], properties: { search: { type: 'string', description: 'Name or keyword of the event to delete' }, date: { type: 'string', description: 'Optional: date to narrow search (YYYY-MM-DD)' } } }
   },
@@ -2345,6 +2633,38 @@ async function executeTool(name, input) {
       return await analyseXeroCSV(filePath);
     }
     case 'get_xero_status':           return await getXeroUploadStatus();
+    case 'generate_quote_pdf': {
+      const filePath = await generateQuotePDF({ clientName: input.client_name, clientEmail: input.client_email || '', packages: input.packages || [], notes: input.notes || '', validDays: input.valid_days || 14 });
+      const driveUrl = await uploadPDFToDrive(filePath, path.basename(filePath));
+      return driveUrl ? `✅ Quote PDF ready Boss!\n\n📄 ${driveUrl}` : `✅ Quote saved locally: ${filePath}`;
+    }
+    case 'generate_invoice_pdf': {
+      const filePath = await generateInvoicePDF({ clientName: input.client_name, clientEmail: input.client_email || '', invoiceNumber: input.invoice_number || '', items: input.items || [], dueDate: input.due_date || '', notes: input.notes || '' });
+      const driveUrl = await uploadPDFToDrive(filePath, path.basename(filePath));
+      return driveUrl ? `✅ Invoice PDF ready Boss!\n\n📄 ${driveUrl}` : `✅ Invoice saved locally: ${filePath}`;
+    }
+    case 'generate_weekly_report_pdf': {
+      const filePath = await generateWeeklyReportPDF();
+      const driveUrl = await uploadPDFToDrive(filePath, path.basename(filePath));
+      return driveUrl ? `✅ Weekly report ready!\n\n📄 ${driveUrl}` : `✅ Report saved locally: ${filePath}`;
+    }
+    case 'generate_content_calendar_sheet': {
+      const url = await generateContentCalendarSheet(input.client, input.weeks || 4);
+      return `✅ Content calendar created!\n\n📊 ${url}`;
+    }
+    case 'generate_production_schedule_sheet': {
+      const url = await generateProductionScheduleSheet();
+      return `✅ Production schedule created!\n\n📊 ${url}`;
+    }
+    case 'generate_expense_sheet': {
+      const url = await generateExpenseSheet();
+      return `✅ Expense tracker created!\n\n📊 ${url}`;
+    }
+    case 'generate_pnl_sheet': {
+      const url = await generatePnLSheet();
+      return `✅ P&L tracker created!\n\n📊 ${url}`;
+    }
+    case 'connect_google':            return `Open this link to connect Google Boss:\nhttps://nonvalidly-unbudgeted-theresa.ngrok-free.dev/google-auth\n\nSign in and approve all permissions. I'll message you when it's done.`;
     case 'delete_calendar_event':     return await deleteCalendarEvent(input.search, input.date || null);
     case 'send_sms':                  return await sendSMS(input.to, input.message);
     case 'create_ghl_opportunity':    return await createGHLOpportunity(input.contact_name, input.contact_phone || '', input.title, input.pipeline || 'sales', input.stage || 'new lead', input.value || '');
@@ -3422,6 +3742,33 @@ app.get('/frameio/callback', async (req, res) => {
     await sendToJackson('Frame.io connected Boss! 🎬');
     res.send('<h2>Frame.io Connected!</h2><p>Close this tab and check WhatsApp.</p>');
   } catch(e) { res.send('Error: ' + e.message); }
+});
+
+// ─── GOOGLE AUTH ROUTES ───────────────────────────────────────────────────────
+app.get('/google-auth', (req, res) => {
+  const result = getGoogleAuthURL();
+  if (!result) return res.send('google-credentials.json not found on server.');
+  res.redirect(result.url);
+});
+
+app.get('/google-callback', async (req, res) => {
+  const { code, error } = req.query;
+  if (error) return res.send(`Google auth error: ${error}`);
+  if (!code) return res.send('No code received.');
+  try {
+    const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH));
+    const { client_secret, client_id } = credentials.installed;
+    const redirectUri = `https://nonvalidly-unbudgeted-theresa.ngrok-free.dev/google-callback`;
+    const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, redirectUri);
+    const { tokens } = await oAuth2Client.getToken(code);
+    oAuth2Client.setCredentials(tokens);
+    fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokens, null, 2));
+    _googleAuth = null; // force reload on next use
+    await sendToJackson('✅ Google reconnected Boss! Calendar, Gmail, and Sheets are all live.');
+    res.send('<h2>✅ Google Connected!</h2><p>Close this tab and check WhatsApp.</p>');
+  } catch(e) {
+    res.send('Error: ' + e.message);
+  }
 });
 
 // ─── XERO FILE UPLOAD ─────────────────────────────────────────────────────────
